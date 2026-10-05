@@ -80,7 +80,8 @@ class StartupTests(TestCase):
         ):
             self.assertTrue(self.daemon.ensure_startup_font())
 
-        workspace = Mock(num=1, name="1")
+        workspace = Mock(num=1)
+        workspace.name = "1"
         window = SimpleNamespace(
             id=42,
             app_id="new-app",

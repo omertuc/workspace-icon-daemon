@@ -45,6 +45,8 @@ class FontBuilder:
         remove_original_symbols: bool = False,
         codepoints: list[int] | None = None,
         fallback_image_path: Path | None = None,
+        advance_fractions: list[float] | None = None,
+        drop_fractions: list[float] | None = None,
     ) -> None:
         """Initialize the FontBuilder.
 
@@ -70,12 +72,24 @@ class FontBuilder:
         if codepoints is not None:
             if len(codepoints) != len(image_paths):
                 raise ValueError("Each image must have exactly one codepoint")
-            if any(type(cp) is not int or not 0xE000 <= cp <= 0xF8FF for cp in codepoints):
-                raise ValueError("Codepoints must be integers in U+E000..U+F8FF")
+            if any(
+                type(cp) is not int
+                or not (0xE000 <= cp <= 0xF8FF or 0x100000 <= cp <= 0x10FFFD)
+                for cp in codepoints
+            ):
+                raise ValueError(
+                    "Codepoints must be integers in U+E000..U+F8FF or "
+                    "U+100000..U+10FFFD"
+                )
             if len(set(codepoints)) != len(codepoints):
                 raise ValueError("Codepoints must be unique")
         self.codepoints = list(codepoints) if codepoints is not None else None
         self.fallback_image_path = fallback_image_path
+        # Per-image advance widths as fractions of the em; e.g. 0 makes the
+        # next glyph draw over this one.
+        self.advance_fractions = advance_fractions
+        # Per-image downward shifts as fractions of the em.
+        self.drop_fractions = drop_fractions
         self.ttfont: TTFont | None = None
         self.strike_index: int = 0
         self.ppem_x: int = 0
@@ -420,7 +434,11 @@ class FontBuilder:
             if any(cp in best_cmap for cp in self.codepoints):
                 raise ValueError("Requested codepoint is already mapped in the font")
 
-        for path, data in images:
+        advance_fractions = self.advance_fractions or [1.0] * len(images)
+        drop_fractions = self.drop_fractions or [0.0] * len(images)
+        for (path, data), advance_fraction, drop_fraction in zip(
+            images, advance_fractions, drop_fractions
+        ):
             actual_size = self.png_size(data)
             if actual_size != (self.ppem_y, self.ppem_y):
                 raise ValueError(
@@ -445,10 +463,14 @@ class FontBuilder:
             self.ttfont["maxp"].numGlyphs = len(glyph_order)
 
             for subtable in self.ttfont["cmap"].tables:
+                # Format 4 subtables only address the Basic Multilingual Plane.
+                if codepoint > 0xFFFF and subtable.format < 12:
+                    continue
                 subtable.cmap[codepoint] = glyph_name
             best_cmap[codepoint] = glyph_name
 
-            self.ttfont["hmtx"].metrics[glyph_name] = (int(ref_advance), 0)
+            glyph_advance = int(round(ref_advance * advance_fraction))
+            self.ttfont["hmtx"].metrics[glyph_name] = (glyph_advance, 0)
             self.ttfont["hhea"].numberOfHMetrics = len(glyph_order)
 
             bitmap = cbdt_bitmap_format_17(b"", self.ttfont)
@@ -456,9 +478,7 @@ class FontBuilder:
             metrics.width = int(self.ppem_y)
             metrics.height = int(self.ppem_y)
 
-            advance_pixels = max(
-                1, int(round(ref_advance * (self.ppem_x / float(upem))))
-            )
+            advance_pixels = int(round(glyph_advance * (self.ppem_x / float(upem))))
             bearing_x = max(0, int(round((advance_pixels - metrics.width) / 2)))
 
             ascender_pixels = int(round(s_typo_ascender * (self.ppem_y / float(upem))))
@@ -466,7 +486,11 @@ class FontBuilder:
                 round(abs(s_typo_descender) * (self.ppem_y / float(upem)))
             )
             line_center_from_baseline = (ascender_pixels - descender_pixels) / 2.0
-            bearing_y = line_center_from_baseline + (metrics.height / 2.0)
+            bearing_y = (
+                line_center_from_baseline
+                + (metrics.height / 2.0)
+                - drop_fraction * self.ppem_y
+            )
 
             metrics.BearingX = self.clamp_int8(bearing_x)
             metrics.BearingY = self.clamp_int8(bearing_y)

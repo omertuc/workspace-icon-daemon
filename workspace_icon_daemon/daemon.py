@@ -11,11 +11,15 @@ import argparse
 import html
 import logging
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,6 +29,13 @@ import i3ipc
 import yaml
 from fontTools.ttLib import TTFont
 
+from .favicons import (
+    FAVICON_PREFIX,
+    FirefoxFavicons,
+    favicon_program,
+    line_icon,
+    stacked_variants,
+)
 from .font_builder import FontBuilder
 from .platform import (
     Compositor,
@@ -106,11 +117,94 @@ PROGRAM_NAME_CORRECTIONS = {
 
 # Other constants
 DEFAULT_FONT_FAMILY_NAME = "WorkspaceIconDaemon"
-PUA_START = 0xE000
+PUA_START = 0xEC00  # clear of Nerd Font / Font Awesome glyphs used by the bar
 PLACEHOLDER_CODEPOINT = PUA_START
 PROGRAM_PUA_START = PUA_START + 1
+# Site favicons live in Supplementary Private Use Area-B so that however many
+# accumulate, they never run into the application icons or other icon fonts.
+FAVICON_PUA_START = 0x100000
+# Half-size top/bottom/middle copies of each icon, for stacking: slots 0-1023
+# mirror the application range, the rest mirror favicons.
+STACK_TOP_START = 0x108000
+STACK_BOTTOM_START = 0x10B000
+STACK_MIDDLE_START = 0x10E000
+STACK_SLOTS = 0x1FF0  # The middle range is the smallest.
+# Zero-width layout lines drawn over icons: under each tabbed icon, above
+# each stacked column, and between the halves of a vertical split's column.
+TAB_UNDERLINE_CODEPOINT = 0x10FFF0
+STACK_OVERLINE_CODEPOINT = 0x10FFF1
+SPLIT_LINE_CODEPOINT = 0x10FFF2
+TAB_UNDERLINE_DROP = 0.12
+# Background behind the focused window's icon in layout titles.
+FOCUS_HIGHLIGHT = "#719cd666"
+LAYOUT_COLORS = {
+    "splith": "#719cd6",
+    "splitv": "#81b29a",
+    "stacked": "#f4a261",
+    "tabbed": "#c58fff",
+}
+# The icon font centres glyphs a little above where titles centre text, which
+# clips the top of a stacked pair; this lowers stacking glyphs (in ems).
+STACK_DROP = 0.08
+# Bump when glyph layout changes without the set of icons changing, so the
+# installed font gets rebuilt. Stored as the font's version string.
+FONT_LAYOUT_VERSION = "workspace-icon-daemon layout 5"
+# Title markup sizes relative to the title text (icons, layout symbols) and to
+# the compositor's title font (stacked icon pairs, which fill its line).
+DEFAULT_TITLE_FONT_SIZE = 10.0
+ICON_SCALE = 1.4
+STACK_SCALE = 1.3
+# How many of the most visited sites get a favicon baked into the font up front.
+FAVICON_TOP_SITES = 300
+# Delay before rebuilding the font for newly seen sites, to batch them.
+FAVICON_REBUILD_DELAY_S = 120
+FAVICON_BADGE_PROGRAMS = ("org.mozilla.firefox", "firefox", "firefox-esr")
+# Terminals whose foreground job (e.g. nvim) gets its own icon, badged with
+# the terminal's.
+TERMINAL_PROGRAMS = (
+    "Alacritty",
+    "foot",
+    "kitty",
+    "org.wezfurlong.wezterm",
+    "com.mitchellh.ghostty",
+    "org.gnome.Ptyxis",
+)
+JOB_PREFIX = "job:"
+# Jobs added to the font up front, so they show from the next login on.
+PRESET_JOBS = ("nvim", "claude", "claude@1", "claude@2", "claude@3")
+# Jobs that show a spinner as the first character of the window title while
+# working; their icon turns a quarter turn (one frame) each time it changes.
+JOB_SPINNERS = {"claude": set("◐◓◑◒")}
+JOB_FRAMES = 4
+ANIMATION_FRAME_S = 0.5
+# Jobs without an installed application icon, shown with a site's favicon.
+JOB_FAVICON_SITES = {"claude": "claude.ai"}
 
 logger = logging.getLogger(__name__)
+
+
+def _has_layout(font_path: Path) -> bool:
+    """Whether a font file was built with the current glyph layout."""
+    try:
+        with TTFont(font_path) as font:
+            return font["name"].getDebugName(5) == FONT_LAYOUT_VERSION
+    except Exception:  # Missing or unreadable font.
+        return False
+
+
+def stacked_codepoints(codepoint: int) -> tuple[int, int, int] | None:
+    """Codepoints of an icon's top, bottom and middle stacking glyphs."""
+    if codepoint >= FAVICON_PUA_START:
+        slot = 1024 + codepoint - FAVICON_PUA_START
+    else:
+        slot = codepoint - PUA_START
+    if not 0 <= slot < STACK_SLOTS:
+        return None
+    return (
+        STACK_TOP_START + slot,
+        STACK_BOTTOM_START + slot,
+        STACK_MIDDLE_START + slot,
+    )
 
 
 class UniqueIconsMode(Enum):
@@ -165,6 +259,7 @@ class ProgramIconMap:
         self.filepath: Path = filepath
         self.programs: dict[str, ProgramIconEntry] = {}
         self.next_unicode_id: int = PROGRAM_PUA_START
+        self.next_favicon_id: int = FAVICON_PUA_START
         self.modified_at_load: bool = False
 
         if not self.filepath.exists():
@@ -218,10 +313,12 @@ class ProgramIconMap:
             valid_unicode_ids = [
                 e.unicode_id for e in self.programs.values() if e.icon_path is not None
             ]
-            if valid_unicode_ids:
-                self.next_unicode_id = max(
-                    PROGRAM_PUA_START, max(valid_unicode_ids) + 1
-                )
+            program_ids = [i for i in valid_unicode_ids if i < FAVICON_PUA_START]
+            favicon_ids = [i for i in valid_unicode_ids if i >= FAVICON_PUA_START]
+            if program_ids:
+                self.next_unicode_id = max(PROGRAM_PUA_START, max(program_ids) + 1)
+            if favicon_ids:
+                self.next_favicon_id = max(favicon_ids) + 1
 
         logger.debug("Loaded %d programs from %s", len(self.programs), self.filepath)
 
@@ -290,9 +387,13 @@ class ProgramIconMap:
 
         # Only assign Unicode ID if we have an icon
         if icon_path is not None:
-            unicode_id = self.next_unicode_id
+            if program_name.startswith(FAVICON_PREFIX):
+                unicode_id = self.next_favicon_id
+                self.next_favicon_id += 1
+            else:
+                unicode_id = self.next_unicode_id
+                self.next_unicode_id += 1
             self.programs[program_name] = ProgramIconEntry(icon_path, unicode_id)
-            self.next_unicode_id += 1
             logger.debug(
                 "Added program: %s -> %s -> U+%04X", program_name, icon_path, unicode_id
             )
@@ -403,6 +504,7 @@ class WorkspaceIconDaemon:
         use_placeholder_icon: bool = True,
         workspace_icons: bool = True,
         titlebar_icons: bool = False,
+        title_text_size: float | None = None,
     ) -> None:
         """Initialize the workspace icon daemon.
 
@@ -433,7 +535,17 @@ class WorkspaceIconDaemon:
         self.use_placeholder_icon: bool = use_placeholder_icon
         self.workspace_icons: bool = workspace_icons
         self.titlebar_icons: bool = titlebar_icons
+        # Title text is drawn at this size (pt), so the compositor's title font
+        # can be set larger to make titlebars taller for the icons.
+        self.title_text_size = title_text_size
         self._titlebar_icon_codepoints: dict[int, int] = {}
+        self._split_container_formats: dict[int, str] = {}
+        self._stacking_available = False
+        self._animating = False
+        self._lock = threading.RLock()
+        self._compositor_font_size: float | None = None
+        self.favicons = FirefoxFavicons(font_output_path.parent)
+        self._favicon_rebuild: threading.Timer | None = None
         # This is intentionally a snapshot.  Installing a replacement font does
         # not make its glyphs available to processes in the current session.
         self._active_program_codepoints: dict[str, int] = {}
@@ -936,7 +1048,8 @@ class WorkspaceIconDaemon:
         entries = sorted(
             (
                 entry
-                for entry in program_icon_map.programs.values()
+                # Snapshot: a delayed favicon rebuild runs on a timer thread.
+                for entry in list(program_icon_map.programs.values())
                 if entry.icon_path is not None
             ),
             key=lambda entry: entry.unicode_id,
@@ -948,6 +1061,32 @@ class WorkspaceIconDaemon:
         icon_paths.extend(entry.icon_path for entry in entries)
         codepoints = [PLACEHOLDER_CODEPOINT]
         codepoints.extend(entry.unicode_id for entry in entries)
+        advance_fractions = [1.0] * len(codepoints)
+        drop_fractions = [0.0] * len(codepoints)
+
+        # Half-size top and bottom copies of every icon, for stacking the
+        # windows of a vertical split in one column of a title.
+        stacked_dir = font_output_path.parent / "stacked"
+        icons = list(zip(icon_paths, codepoints))
+        for position, layout, codepoint, drop in (
+            ("under", "tabbed", TAB_UNDERLINE_CODEPOINT, TAB_UNDERLINE_DROP),
+            ("over", "stacked", STACK_OVERLINE_CODEPOINT, STACK_DROP),
+            ("between", "splitv", SPLIT_LINE_CODEPOINT, STACK_DROP),
+        ):
+            icon_paths.append(line_icon(stacked_dir, position, LAYOUT_COLORS[layout]))
+            codepoints.append(codepoint)
+            advance_fractions.append(0.0)
+            drop_fractions.append(drop)
+        for icon_path, codepoint in icons:
+            stacked = stacked_codepoints(codepoint)
+            variants = stacked_variants(icon_path, stacked_dir, f"{codepoint:X}")
+            if stacked is None or variants is None:
+                continue
+            icon_paths.extend(variants)
+            codepoints.extend(stacked)
+            # The top half takes no space, so the bottom half draws under it.
+            advance_fractions.extend((0.0, 0.5, 0.5))
+            drop_fractions.extend((STACK_DROP,) * 3)
 
         builder = FontBuilder(
             base_font_path=base_font_path,
@@ -958,9 +1097,12 @@ class WorkspaceIconDaemon:
             remove_original_symbols=True,
             codepoints=codepoints,
             fallback_image_path=PLACEHOLDER_ICON_PATH,
+            advance_fractions=advance_fractions,
+            drop_fractions=drop_fractions,
         )
         try:
             builder.build_complete_font()
+            builder.ttfont["name"].setName(FONT_LAYOUT_VERSION, 5, 3, 1, 0x409)
             builder.save()
         finally:
             if builder.ttfont is not None:
@@ -1167,24 +1309,208 @@ class WorkspaceIconDaemon:
         if not self.workspace_icons:
             return
 
-        workspaces_info = self.get_programs_by_workspace(
-            self.connection, self.compositor, self.IGNORED_PROGRAMS
-        )
-
-        for ws_info in workspaces_info:
+        for workspace in self.connection.get_tree().workspaces():
             icons = [
                 chr(unicode_id)
-                for program in ws_info.programs
-                if (unicode_id := self._active_unicode_id(program)) is not None
+                for window in self._sort_windows_by_layout(workspace.leaves())
+                if self._get_window_name(window, self.compositor)
+                not in self.IGNORED_PROGRAMS
+                and (unicode_id := self._window_unicode_id(window)) is not None
             ]
 
             # Process icons based on the unique_icons_mode
             processed_icons = self._process_icons(icons)
 
-            new_name = self._construct_workspace_name(ws_info.num, processed_icons)
+            new_name = self._construct_workspace_name(
+                workspace.num,
+                processed_icons,
+                self._workspace_base_name(workspace.name),
+            )
 
-            if new_name != ws_info.name:
-                self.rename_workspace(self.connection, ws_info.name, new_name)
+            if new_name != workspace.name:
+                self.rename_workspace(self.connection, workspace.name, new_name)
+
+    @staticmethod
+    def _terminal_job(window: i3ipc.Con) -> str | None:
+        """Name of the job in the foreground of a terminal window's shell."""
+        pid = getattr(window, "pid", None)
+        if not isinstance(pid, int):
+            return None
+        try:
+            children = [
+                int(child)
+                for task in Path(f"/proc/{pid}/task").iterdir()
+                for child in (task / "children").read_text().split()
+            ]
+            if not children:
+                return None
+            shell = children[0]
+            stat = Path(f"/proc/{shell}/stat").read_text()
+            # comm may contain spaces and parentheses; fields resume after the
+            # last ')': state, ppid, pgrp, session, tty_nr, tpgid.
+            foreground = int(stat[stat.rindex(")") + 2 :].split()[5])
+            if foreground in (shell, -1):
+                return None
+            return Path(f"/proc/{foreground}/comm").read_text().strip() or None
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _spinner_frame(self, window: i3ipc.Con, job: str) -> int:
+        """Animation frame of a working job's icon, or 0 when it is idle.
+
+        Frames come from the clock rather than from the title's spinner,
+        which e.g. Claude Code stops updating while its terminal is unfocused.
+        """
+        if (window.name or "")[:1] not in JOB_SPINNERS.get(job, ()):
+            return 0
+        self._animating = True
+        return int(time.monotonic() / ANIMATION_FRAME_S) % JOB_FRAMES
+
+    def _animate(self) -> None:
+        """Redraw icons each animation frame while any job is working."""
+        while True:
+            time.sleep(ANIMATION_FRAME_S)
+            with self._lock:
+                if not self._animating:
+                    continue
+                self._animating = False  # Set again by any still-working job.
+                try:
+                    self.update_workspace_names()
+                    self.update_window_titles()
+                except Exception as exc:  # Keep animating through IPC hiccups.
+                    logger.debug("Animation update failed: %s", exc)
+
+    def _job_icon(self, job: str, terminal: str) -> Path | None:
+        """A job's icon badged with its terminal's icon. ``job@N`` is
+        animation frame N: the icon turned by N quarter turns."""
+        job, _, frame = job.partition("@")
+        badge = self.program_icon_map.get_icon_path(terminal)
+        if site := JOB_FAVICON_SITES.get(job):
+            if badge is None:
+                return None
+            return self.favicons.export_icon(site, badge, 90 * int(frame or 0))
+        icon = self.find_icon_for_program(job)
+        if icon is None or badge is None:
+            return None
+        return self.favicons.badged_icon(icon, badge, job)
+
+    def _add_job(self, job: str, terminal: str) -> bool:
+        """Add a terminal job's icon; returns whether a new glyph is needed."""
+        program = f"{JOB_PREFIX}{job}"
+        if program in self.program_icon_map.programs:
+            return False
+        icon_path = self._job_icon(job, terminal)
+        self.program_icon_map.add_program(program, icon_path)
+        self.program_icon_map.save()
+        return icon_path is not None
+
+    def add_preset_jobs(self) -> bool:
+        # Badge with the terminal in use, or else the first one installed.
+        running = {
+            self._get_window_name(window, self.compositor)
+            for window in self.connection.get_tree().leaves()
+        }
+        terminal = next(
+            (
+                t
+                for t in sorted(TERMINAL_PROGRAMS, key=lambda t: t not in running)
+                if self.program_icon_map.get_icon_path(t)
+            ),
+            None,
+        )
+        if terminal is None:
+            return False
+        return any([self._add_job(job, terminal) for job in PRESET_JOBS])
+
+    def _window_unicode_id(self, window: i3ipc.Con) -> int | None:
+        """The window's site favicon if it is a browser on a known site, the
+        icon of its foreground job if it is a terminal, otherwise its
+        application icon."""
+        program = self._get_window_name(window, self.compositor)
+        if not program:
+            return None
+        if program in TERMINAL_PROGRAMS and (job := self._terminal_job(window)):
+            frame = self._spinner_frame(window, job)
+            # Frames missing from the loaded font fall back to the icon at rest.
+            if frame and f"{JOB_PREFIX}{job}@{frame}" in self._active_program_codepoints:
+                job = f"{job}@{frame}"
+            job_program = f"{JOB_PREFIX}{job}"
+            if (unicode_id := self._active_program_codepoints.get(job_program)) is not None:
+                return unicode_id
+            if self._add_job(job, program):
+                self._schedule_font_rebuild()
+        if self.favicons.is_browser(program):
+            host = self.favicons.host_for_window(program, window.name)
+            if host:
+                favicon = favicon_program(host)
+                if (unicode_id := self._active_program_codepoints.get(favicon)) is not None:
+                    return unicode_id
+                if favicon not in self.program_icon_map.programs:
+                    self._add_favicon_later(host)
+        return self._active_unicode_id(program)
+
+    def _favicon_badge(self) -> Path | None:
+        """Icon overlaid on favicons to show which browser a window is."""
+        for program in FAVICON_BADGE_PROGRAMS:
+            if icon_path := self.program_icon_map.get_icon_path(program):
+                return icon_path
+        return None
+
+    def _add_favicon(self, host: str) -> bool:
+        """Add or refresh a site's favicon; returns whether its glyph changed."""
+        program = favicon_program(host)
+        entry = self.program_icon_map.programs.get(program)
+        if entry is not None and entry.icon_path is None:
+            return False  # Known to have no favicon.
+        icon_path = self.favicons.export_icon(host, self._favicon_badge())
+        if entry is not None:
+            if icon_path is None or icon_path == entry.icon_path:
+                return False
+            self.program_icon_map.programs[program] = ProgramIconEntry(
+                icon_path, entry.unicode_id
+            )
+            return True
+        # Sites without a favicon are remembered so they are not looked up again.
+        self.program_icon_map.add_program(program, icon_path)
+        return icon_path is not None
+
+    def add_top_favicons(self) -> bool:
+        """Add favicons of the most visited sites, and refresh known ones."""
+        if not self.titlebar_icons or not self.favicons.available:
+            return False
+        known = [
+            program.removeprefix(FAVICON_PREFIX)
+            for program in self.program_icon_map.programs
+            if program.startswith(FAVICON_PREFIX)
+        ]
+        hosts = dict.fromkeys(self.favicons.top_hosts(FAVICON_TOP_SITES) + known)
+        changed = [host for host in hosts if self._add_favicon(host)]
+        self.program_icon_map.save()
+        logger.info("Added or updated %d site favicons", len(changed))
+        return bool(changed)
+
+    def _add_favicon_later(self, host: str) -> None:
+        """Add a newly seen site's favicon to the font for the next session.
+
+        Deliberately silent: until then the browser icon is shown, and the
+        favicon simply appears after some later login.
+        """
+        added = self._add_favicon(host)
+        self.program_icon_map.save()
+        if added:
+            self._schedule_font_rebuild()
+
+    def _schedule_font_rebuild(self) -> None:
+        """Quietly rebuild the font for the next session, batching additions."""
+        if self._favicon_rebuild is not None:
+            self._favicon_rebuild.cancel()
+        self._favicon_rebuild = threading.Timer(
+            FAVICON_REBUILD_DELAY_S,
+            self._publish_font_update,
+            kwargs={"new_application": False},
+        )
+        self._favicon_rebuild.daemon = True
+        self._favicon_rebuild.start()
 
     def update_window_titles(self) -> None:
         """Apply the mapped application icon to every window title.
@@ -1199,10 +1525,7 @@ class WorkspaceIconDaemon:
         family = html.escape(self.font_family_name, quote=True)
         visible_container_ids: set[int] = set()
         for window in self.connection.get_tree().leaves():
-            program = self._get_window_name(window, self.compositor)
-            unicode_id = (
-                self._active_unicode_id(program) if program else None
-            )
+            unicode_id = self._window_unicode_id(window)
             container_id = getattr(window, "id", None)
             if unicode_id is None or not isinstance(container_id, int):
                 continue
@@ -1210,8 +1533,11 @@ class WorkspaceIconDaemon:
             if self._titlebar_icon_codepoints.get(container_id) == unicode_id:
                 continue
 
+            # A leading zero-width space keeps the line metrics from the title
+            # font; otherwise Sway ignores the icon span's size.
             title_format = (
-                f"<span font_family='{family}'>&#x{unicode_id:X};</span> %title"
+                f"&#x200B;<span font_family='{family}' size='{self._icon_size}'>"
+                f"&#x{unicode_id:X};</span> {self._title_text('%title')}"
             )
             # Record this before sending the command: changing title_format may
             # itself cause a window::title event on some compositor versions.
@@ -1226,6 +1552,150 @@ class WorkspaceIconDaemon:
             if container_id in visible_container_ids
         }
 
+        self._update_split_container_titles(family)
+
+    def _split_containers(self) -> list[i3ipc.Con]:
+        """Return the non-window containers nested inside workspaces."""
+        return [
+            con
+            for workspace in self.connection.get_tree().workspaces()
+            for con in workspace.descendants()
+            if con.type == "con" and con.nodes
+        ]
+
+    # Symbol and colour per layout; the brackets share the colour so nesting
+    # stays readable.
+    # Separators between the parts of a split; tabbed icons sit side by side
+    # over a line and stacked ones on top of each other under a line.
+    LAYOUT_SEPARATORS = {"splith": "|", "splitv": "—", "tabbed": "", "stacked": " "}
+
+    def _icon_markup(
+        self, unicode_id: int, family: str, underline: bool = False, focused: bool = False
+    ) -> str:
+        line = f"&#x{TAB_UNDERLINE_CODEPOINT:X};" if underline else ""
+        highlight = f" background='{FOCUS_HIGHLIGHT}'" if focused else ""
+        return (
+            f"<span font_family='{family}' size='{self._icon_size}'{highlight}>"
+            f"{line}&#x{unicode_id:X};</span>"
+        )
+
+    def _container_representation(
+        self, con: i3ipc.Con, family: str, nested: bool = False, underline: bool = False
+    ) -> str:
+        """Render a container's layout with its windows' icons: ``A|B`` side
+        by side, ``A—B`` top and bottom, tabbed icons over a line and stacked
+        icons on top of each other under a line. Nested groups get brackets."""
+        if not con.nodes:
+            unicode_id = self._window_unicode_id(con)
+            if unicode_id is None:
+                program = self._get_window_name(con, self.compositor)
+                return html.escape(program or "?")
+            return self._icon_markup(unicode_id, family, underline, bool(con.focused))
+        if len(con.nodes) == 1:
+            return self._container_representation(con.nodes[0], family, nested, underline)
+        if stacked := self._stacked_icons(con, family):
+            return stacked
+        color = LAYOUT_COLORS.get(con.layout, "#888888")
+        separator = self.LAYOUT_SEPARATORS.get(con.layout, " ")
+        if separator.strip():
+            separator = (
+                f"<span foreground='{color}' weight='bold' size='{self._text_size}'>"
+                f"{separator}</span>"
+            )
+        body = separator.join(
+            self._container_representation(
+                child,
+                family,
+                nested=True,
+                underline=con.layout == "tabbed" and self._stacking_available,
+            )
+            for child in con.nodes
+        )
+        if not nested:
+            return body
+        bracket = f"<span foreground='#888888' size='{self._text_size}'>"
+        return f"{bracket}[</span>{body}{bracket}]</span>"
+
+    def _stacked_icons(self, con: i3ipc.Con, family: str) -> str | None:
+        """Icons of a vertical split's or stacked layout's windows on top of
+        each other, or None if that can't be shown: the layout holds
+        containers, a vertical split has more than two windows (columns would
+        read as a horizontal split), or the loaded font can't stack."""
+        if con.layout not in ("splitv", "stacked") or not self._stacking_available:
+            return None
+        if any(child.nodes for child in con.nodes):
+            return None
+        if con.layout == "splitv" and len(con.nodes) != 2:
+            return None
+        unicode_ids = [self._window_unicode_id(child) for child in con.nodes]
+        if None in unicode_ids:
+            return None
+        stacked = [stacked_codepoints(unicode_id) for unicode_id in unicode_ids]
+        if None in stacked:
+            return None
+        glyph = "&#x{:X};".format
+        over = glyph(STACK_OVERLINE_CODEPOINT) if con.layout == "stacked" else ""
+        between = glyph(SPLIT_LINE_CODEPOINT) if con.layout == "splitv" else ""
+        columns = []
+        for index in range(0, len(stacked), 2):
+            if index + 1 < len(stacked):
+                top, bottom = stacked[index][0], stacked[index + 1][1]
+                column = f"{over}{glyph(top)}{between}{glyph(bottom)}"
+            else:
+                column = f"{over}{glyph(stacked[index][2])}"
+            if any(child.focused for child in con.nodes[index : index + 2]):
+                column = f"<span background='{FOCUS_HIGHLIGHT}'>{column}</span>"
+            columns.append(column)
+        return (
+            f"<span font_family='{family}' size='{self._stack_size}'>"
+            f"{''.join(columns)}</span>"
+        )
+
+    def _title_font_size(self) -> float:
+        """Size in pt of the compositor's title font, from its config."""
+        if self._compositor_font_size is None:
+            self._compositor_font_size = DEFAULT_TITLE_FONT_SIZE
+            try:
+                config = self.connection.get_config().config
+            except Exception:  # Not every IPC implementation supports this.
+                config = ""
+            if match := re.search(r"^font\s+(.*?)\s*$", config, re.MULTILINE):
+                if size := re.search(r"([\d.]+)\s*(px)?$", match.group(1)):
+                    points = float(size.group(1))
+                    self._compositor_font_size = points * 0.75 if size.group(2) else points
+        return self._compositor_font_size
+
+    @property
+    def _text_size(self) -> str:
+        return f"{self.title_text_size or self._title_font_size():g}pt"
+
+    def _title_text(self, text: str) -> str:
+        if self.title_text_size is None:
+            return text
+        return f"<span size='{self._text_size}'>{text}</span>"
+
+    @property
+    def _icon_size(self) -> str:
+        return f"{(self.title_text_size or self._title_font_size()) * ICON_SCALE:g}pt"
+
+    @property
+    def _stack_size(self) -> str:
+        # Stacked pairs fill the line the compositor's (possibly larger) title
+        # font makes room for.
+        return f"{self._title_font_size() * STACK_SCALE:g}pt"
+
+    def _update_split_container_titles(self, family: str) -> None:
+        """Replace Sway's ``H[app app]`` split container titles with icons."""
+        formats: dict[int, str] = {}
+        for con in self._split_containers():
+            title_format = self._container_representation(con, family)
+            formats[con.id] = title_format
+            if self._split_container_formats.get(con.id) != title_format:
+                self.connection.command(
+                    f'[con_id={con.id}] title_format "{title_format}"'
+                )
+        self._split_container_formats = formats
+
     def reset_window_titles(self) -> None:
         """Restore the default title format on windows managed by the daemon."""
         if not self.titlebar_icons:
@@ -1237,7 +1707,10 @@ class WorkspaceIconDaemon:
                 self.connection.command(
                     f'[con_id={container_id}] title_format "%title"'
                 )
+        for con in self._split_containers():
+            self.connection.command(f'[con_id={con.id}] title_format "%title"')
         self._titlebar_icon_codepoints.clear()
+        self._split_container_formats.clear()
 
     def _process_icons(self, icons: list[str]) -> list[str]:
         """Process icons based on the unique_icons_mode.
@@ -1294,18 +1767,42 @@ class WorkspaceIconDaemon:
         digits = self.SUPERSCRIPT_DIGITS if use_superscript else self.SUBSCRIPT_DIGITS
         return "".join(digits[int(d)] for d in str(count))
 
+    def _workspace_base_name(self, name: str) -> str:
+        """The workspace name without the icon suffix this daemon appended.
+
+        Only a trailing run of our own glyphs (with their count digits and
+        spaces) is removed, so whatever the user named the workspace survives.
+        """
+        icon_chars = {chr(PLACEHOLDER_CODEPOINT)} | {
+            chr(entry.unicode_id)
+            for entry in self.program_icon_map.programs.values()
+            if entry.icon_path is not None
+        }
+        suffix_chars = icon_chars | set(self.SUBSCRIPT_DIGITS + self.SUPERSCRIPT_DIGITS + " ")
+        base = name.rstrip("".join(suffix_chars))
+        if not icon_chars & set(name[len(base):]):
+            return name  # No icons of ours; leave e.g. trailing spaces alone.
+        return base
+
     @staticmethod
-    def _construct_workspace_name(num: int, icons: list[str]) -> str:
-        """Construct a workspace name from number and icons.
+    def _construct_workspace_name(
+        num: int, icons: list[str], base_name: str | None = None
+    ) -> str:
+        """Construct a workspace name from its base name and icons.
 
         Args:
             num: The workspace number.
             icons: List of icon strings.
+            base_name: The name without our icons; defaults to the number.
 
         Returns:
-            The formatted workspace name ("NUM: ICONS" or just "NUM").
+            "NUM: ICONS" for a bare numbered workspace, otherwise
+            "BASE ICONS", or the base name alone when there are no icons.
         """
-        return f"{num}: {''.join(icons)}" if icons else str(num)
+        if base_name is None or re.fullmatch(r"\d+:?", base_name.strip()):
+            base_name = str(num) if num >= 0 else (base_name or "").rstrip(":")
+            return f"{base_name}: {''.join(icons)}" if icons else base_name
+        return f"{base_name} {''.join(icons)}" if icons else base_name
 
     def on_window_event(
         self, _connection: i3ipc.Connection, event: i3ipc.Event
@@ -1316,6 +1813,11 @@ class WorkspaceIconDaemon:
             _connection: The connection (unused, required by i3ipc API).
             event: The window event.
         """
+        container = getattr(event, "container", None)
+        if event.change in {"new", "title"} and self.favicons.is_browser(
+            self._get_window_name(container, self.compositor) if container else None
+        ):
+            self.favicons.forget_window_titles()
         if event.change in {"new", "close", "move", "title"}:
             self.process_new_programs()
             self.update_workspace_names()
@@ -1336,7 +1838,9 @@ class WorkspaceIconDaemon:
 
         if self.workspace_icons:
             for workspace in self.connection.get_tree().workspaces():
-                new_name = self._construct_workspace_name(workspace.num, [])
+                new_name = self._construct_workspace_name(
+                    workspace.num, [], self._workspace_base_name(workspace.name)
+                )
                 if new_name != workspace.name:
                     self.rename_workspace(self.connection, workspace.name, new_name)
 
@@ -1350,6 +1854,13 @@ class WorkspaceIconDaemon:
         self.update_workspace_names()
         self.update_window_titles()
 
+        def locked(handler: Callable[[], None]) -> Callable[..., None]:
+            def run(*_args: object) -> None:
+                with self._lock:
+                    handler()
+
+            return run
+
         for event in (
             "window::new",
             "window::close",
@@ -1357,7 +1868,17 @@ class WorkspaceIconDaemon:
             "window::title",
             "workspace::move",
         ):
-            self.connection.on(event, self.on_window_event)
+            self.connection.on(
+                event,
+                lambda c, e: locked(lambda: self.on_window_event(c, e))(),
+            )
+        # Re-add icons right after the user renames a workspace. Our own renames
+        # trigger this too, but then the name is already up to date.
+        self.connection.on("workspace::rename", locked(self.update_workspace_names))
+        self.connection.on("window::focus", locked(self.update_window_titles))
+        # Splits and layout changes emit no window event, only a binding event.
+        self.connection.on("binding", locked(self.update_window_titles))
+        threading.Thread(target=self._animate, daemon=True).start()
 
         logger.info("Daemon is running. Press Ctrl+C to exit.")
         self.connection.main()
@@ -1369,10 +1890,14 @@ class WorkspaceIconDaemon:
         snapshot is the only mapping used for the lifetime of this process.
         """
         destination = self.font_installer.fonts_dir / self.font_output_path.name
-        active_font_available = self._snapshot_active_font(destination)
+        active_font_available = self._snapshot_active_font(
+            self._session_font(destination)
+        )
         map_was_repaired = self.program_icon_map.modified_at_load
         installed_added = self.discover_installed_programs()
         running_added = self._add_running_programs()
+        favicons_changed = self.add_top_favicons()
+        favicons_changed = self.add_preset_jobs() or favicons_changed
 
         expected = {
             entry.unicode_id
@@ -1392,21 +1917,40 @@ class WorkspaceIconDaemon:
             )
             return False
 
-        if (
-            installed_added
-            or running_added
-            or map_was_repaired
-            or installed_is_outdated
-        ):
+        if installed_added or running_added or map_was_repaired:
             self._publish_font_update(new_application=True)
+        elif installed_is_outdated or favicons_changed or not _has_layout(destination):
+            # Only favicons changed; they show up quietly after a later login.
+            self._publish_font_update(new_application=False)
 
         self.program_icon_map.modified_at_load = False
         return True
+
+    def _session_font(self, installed_font: Path) -> Path:
+        """The font as it was when this compositor session started.
+
+        The compositor keeps the font it loaded at login, while the installed
+        file is replaced by rebuilds, so the first daemon start of a session
+        keeps a copy for later restarts (e.g. on config reloads) to consult.
+        """
+        socket = os.environ.get("SWAYSOCK") or os.environ.get("I3SOCK") or ""
+        session = re.search(r"\.(\d+)\.sock$", socket)
+        if session is None or not installed_font.is_file():
+            return installed_font
+        session_dir = self.font_output_path.parent / "sessions"
+        session_font = session_dir / f"{session.group(1)}.ttf"
+        if not session_font.is_file():
+            session_dir.mkdir(parents=True, exist_ok=True)
+            for stale in session_dir.glob("*.ttf"):
+                stale.unlink(missing_ok=True)
+            shutil.copyfile(installed_font, session_font)
+        return session_font
 
     def _snapshot_active_font(self, installed_font: Path) -> bool:
         """Capture mappings which are actually present in the installed font."""
         self._active_program_codepoints.clear()
         self._active_placeholder_available = False
+        self._stacking_available = False
         if not installed_font.is_file():
             return False
         try:
@@ -1422,6 +1966,10 @@ class WorkspaceIconDaemon:
                 ):
                     return False
                 self._active_placeholder_available = True
+                # Stacking and layout-line glyphs move between layouts.
+                self._stacking_available = (
+                    font["name"].getDebugName(5) == FONT_LAYOUT_VERSION
+                )
                 for program, entry in self.program_icon_map.programs.items():
                     if (
                         entry.icon_path is not None
@@ -1522,6 +2070,15 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Add generated application icons to window titlebars. Pango markup "
             "must be enabled for the compositor title font (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--title-text-size",
+        type=float,
+        metavar="PT",
+        help=(
+            "Draw title text at this size. Set the compositor's title font "
+            "larger than this to make titlebars taller, giving icons more room."
         ),
     )
     reset_group = parser.add_mutually_exclusive_group()
@@ -1643,6 +2200,7 @@ def main() -> None:
         use_placeholder_icon=not args.no_placeholder_icon,
         workspace_icons=args.workspace_icons,
         titlebar_icons=args.titlebar_icons,
+        title_text_size=args.title_text_size,
     )
 
     pid_path = args.font_output.parent / DEFAULT_PID_PATH.name
