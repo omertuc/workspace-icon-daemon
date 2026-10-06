@@ -1,0 +1,37 @@
+output HEADLESS-1 resolution 3200x1800 scale @SCALE@ bg @BG@ fill
+# Apps are launched ahead of a shot on this second, unrecorded output.
+workspace stage output HEADLESS-2
+
+font pango:Inter Medium @FONT@
+titlebar_padding 10 6
+titlebar_border_thickness 0
+default_border normal 0
+gaps inner @GAPS_INNER@
+gaps outer @GAPS_OUTER@
+focus_follows_mouse no
+seat * hide_cursor 100
+
+#                       border    bg        text      indicator child
+client.focused          #1d1b2acc #1d1b2aee #ffffff   #1d1b2a   #1d1b2a
+client.focused_inactive #14121ecc #14121ecc #a8a4b8   #14121e   #14121e
+client.unfocused        #14121ecc #14121ecc #8a869a   #14121e   #14121e
+for_window [app_id="Alacritty"] opacity 0.96
+
+# Scenes press real keys: the daemon redraws layouts on binding events.
+set $mod Mod4
+bindsym $mod+w layout tabbed
+bindsym $mod+s layout stacking
+bindsym $mod+h layout splith
+bindsym $mod+j layout splitv
+bindsym $mod+b splith
+bindsym $mod+v splitv
+bindsym $mod+a focus parent
+
+# Browser favicons need the accessibility bus.
+exec gsettings set org.gnome.desktop.interface toolkit-accessibility true
+exec gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+exec /usr/libexec/at-spi-bus-launcher --launch-immediately
+exec sleep 1 && /usr/libexec/at-spi2-registryd
+exec waybar
+exec @DAEMON@ --title-text-size @TITLE_SIZE@ -v > @LOG@ 2>&1
+exec touch @READY@

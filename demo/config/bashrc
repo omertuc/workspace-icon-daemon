@@ -1,0 +1,6 @@
+PS1='\[\e[38;5;141m\]\w\[\e[0m\] \[\e[38;5;204m\]❯\[\e[0m\] '
+# Window titles follow the running command, as with most shell setups; the
+# daemon notices the terminal's job when the title changes.
+PROMPT_COMMAND='printf "\e]0;%s\a" "${PWD/#$HOME/\~}"'
+trap '[[ $BASH_COMMAND != printf* ]] && printf "\e]0;%s\a" "$BASH_COMMAND"' DEBUG
+cd ~/workspace-icon-daemon 2>/dev/null

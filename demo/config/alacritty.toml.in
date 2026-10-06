@@ -1,0 +1,15 @@
+[terminal.shell]
+program = "bash"
+args = ["--rcfile", "@BASHRC@"]
+
+[window]
+padding = { x = 18, y = 14 }
+opacity = 0.96
+
+[font]
+normal = { family = "Adwaita Mono" }
+size = 12
+
+[colors.primary]
+background = "#16141f"
+foreground = "#dcd8ea"

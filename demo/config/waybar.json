@@ -1,0 +1,8 @@
+{
+  "layer": "top", "output": "HEADLESS-1", "position": "top", "height": 40,
+  "margin-top": 8, "margin-left": 14, "margin-right": 14,
+  "modules-left": ["sway/workspaces"],
+  "modules-right": ["clock"],
+  "sway/workspaces": { "disable-scroll": true },
+  "clock": { "format": "{:%H:%M}" }
+}
