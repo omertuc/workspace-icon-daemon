@@ -4,11 +4,14 @@
 //! metrics, its bitmap strike's size and (unless removed) its own glyphs,
 //! and every image becomes a PNG glyph mapped to a PUA code point.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
-use read_fonts::tables::bitmap::BitmapLocation;
+use anyhow::{Context, Result, bail};
+use read_fonts::tables::bitmap::{BitmapLocation, BitmapSize};
+use read_fonts::tables::cbdt::Cbdt;
+use read_fonts::tables::cblc::Cblc;
+use read_fonts::tables::hmtx::LongMetric;
 use read_fonts::types::{GlyphId, Tag};
 use read_fonts::{FontRef, TableProvider};
 
@@ -19,20 +22,50 @@ pub const PUA_START: u32 = 0xE000;
 const PNG_IMAGE_FORMAT: u16 = 17;
 
 fn is_pua(codepoint: u32) -> bool {
-    (0xE000..=0xF8FF).contains(&codepoint) || (0x100000..=0x10FFFD).contains(&codepoint)
+    (0xE000..=0xF8FF).contains(&codepoint) || (0x0010_0000..=0x0010_FFFD).contains(&codepoint)
 }
 
 /// Python-style rounding: halves go to the even neighbour.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "out-of-range values saturate, as intended"
+)]
 fn round(value: f64) -> i64 {
     value.round_ties_even() as i64
 }
 
+/// [`round`], as a float.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "rounded font metrics are far below 2^52"
+)]
+fn round_to_f64(value: f64) -> f64 {
+    round(value) as f64
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is clamped to the i8 range"
+)]
 fn clamp_i8(value: f64) -> i8 {
     round(value).clamp(-128, 127) as i8
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to the u8 range"
+)]
 fn clamp_u8(value: f64) -> u8 {
     round(value).clamp(0, 255) as u8
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to the u16 range"
+)]
+fn clamp_u16(value: f64) -> u16 {
+    round(value).clamp(0, i64::from(u16::MAX)) as u16
 }
 
 /// Settings for building an icon font.
@@ -42,7 +75,7 @@ pub struct FontBuilder {
     pub pua_start: u32,
     /// Keep only .notdef and space from the base font.
     pub remove_original_symbols: bool,
-    /// Code points in image order; allocated from pua_start when absent.
+    /// Code points in image order; allocated from `pua_start` when absent.
     pub codepoints: Option<Vec<u32>>,
     /// Substituted for images that cannot be decoded. Without one, decoding
     /// errors are returned.
@@ -83,21 +116,39 @@ struct Glyph {
     bitmap: Option<Vec<u8>>,
 }
 
+/// The glyphs carried over from the base font, keeping their glyph ids.
+struct BaseGlyphs {
+    glyphs: Vec<Glyph>,
+    cmap: BTreeMap<u32, u32>,
+    /// The base font's space glyph.
+    space: Option<u32>,
+}
+
+/// The geometry shared by all icon glyphs.
+struct IconMetrics {
+    ppem: u8,
+    upem: f64,
+    /// The advance, in font units, of an icon with an advance fraction of 1.
+    reference_advance: f64,
+    /// The vertical centre of the line, in pixels above the baseline.
+    line_center: f64,
+}
+
 /// The size of the base font's first bitmap strike.
 pub fn strike_size(base_font: &[u8]) -> Result<u32> {
-    let font = FontRef::new(base_font)?;
+    let font = FontRef::new(base_font).context("reading base font")?;
     let cblc = font
         .cblc()
-        .context("Base font must be CBDT/CBLC (like NotoColorEmoji.ttf)")?;
+        .context("reading CBLC table (base font must be CBDT/CBLC, like NotoColorEmoji.ttf)")?;
     let size = cblc
         .bitmap_sizes()
         .first()
-        .context("Base font has no bitmap strike")?;
-    Ok(size.ppem_y() as u32)
+        .context("base font has no bitmap strike")?;
+    Ok(u32::from(size.ppem_y()))
 }
 
-/// Load and normalize images to target_px squares, substituting the fallback
-/// image for any that cannot be read.
+/// Load and normalize images to `target_px` squares, substituting the
+/// fallback image for any that cannot be read.
 pub fn collect_images(
     paths: &[PathBuf],
     target_px: u32,
@@ -119,10 +170,12 @@ pub fn collect_images(
                     path.display(),
                     fallback.display()
                 );
-                if fallback_data.is_none() {
-                    fallback_data = Some(raster::collect_image(fallback, target_px)?);
+                if let Some(data) = &fallback_data {
+                    return Ok(data.clone());
                 }
-                Ok(fallback_data.clone().unwrap())
+                let data = raster::collect_image(fallback, target_px)
+                    .with_context(|| format!("collecting fallback image {}", fallback.display()))?;
+                Ok(fallback_data.insert(data).clone())
             }
         })
         .collect()
@@ -134,24 +187,26 @@ impl FontBuilder {
             return Ok(());
         };
         if codepoints.len() != count {
-            bail!("Each image must have exactly one codepoint");
+            bail!("each image must have exactly one codepoint");
         }
         if !codepoints.iter().all(|&cp| is_pua(cp)) {
-            bail!("Codepoints must be integers in U+E000..U+F8FF or U+100000..U+10FFFD");
+            bail!("codepoints must be integers in U+E000..U+F8FF or U+100000..U+10FFFD");
         }
         if codepoints.iter().collect::<HashSet<_>>().len() != codepoints.len() {
-            bail!("Codepoints must be unique");
+            bail!("codepoints must be unique");
         }
         Ok(())
     }
 
     /// Build a font from image files.
     pub fn build(&self, base_font: &[u8], image_paths: &[PathBuf]) -> Result<BuiltFont> {
-        self.validate_codepoints(image_paths.len())?;
-        let target = strike_size(base_font)?;
-        let images = collect_images(image_paths, target, self.fallback_image.as_deref())?;
+        self.validate_codepoints(image_paths.len())
+            .context("validating codepoints")?;
+        let target = strike_size(base_font).context("reading the base font's strike size")?;
+        let images = collect_images(image_paths, target, self.fallback_image.as_deref())
+            .context("collecting images")?;
         if images.is_empty() {
-            bail!("No valid images found");
+            bail!("no valid images found");
         }
         let names: Vec<String> = image_paths
             .iter()
@@ -167,28 +222,115 @@ impl FontBuilder {
         images: &[Vec<u8>],
         names: &[String],
     ) -> Result<BuiltFont> {
-        self.validate_codepoints(images.len())?;
-        let font = FontRef::new(base_font).context("Reading base font")?;
-        let (cblc, cbdt) = match (font.cblc(), font.cbdt()) {
-            (Ok(cblc), Ok(cbdt)) => (cblc, cbdt),
-            _ => bail!("Base font must be CBDT/CBLC (like NotoColorEmoji.ttf)"),
+        self.validate_codepoints(images.len())
+            .context("validating codepoints")?;
+        let font = FontRef::new(base_font).context("reading base font")?;
+        let (Ok(cblc), Ok(cbdt)) = (font.cblc(), font.cbdt()) else {
+            bail!("base font must be CBDT/CBLC (like NotoColorEmoji.ttf)");
         };
         let strike = cblc
             .bitmap_sizes()
             .first()
-            .context("Base font has no bitmap strike")?;
-        let (ppem_x, ppem_y) = (strike.ppem_x() as u32, strike.ppem_y() as u32);
-        if ppem_x != ppem_y {
-            bail!("Non-square CBDT strike not supported");
+            .context("base font has no bitmap strike")?;
+        let ppem = strike.ppem_y();
+        if strike.ppem_x() != ppem {
+            bail!("non-square CBDT strike not supported");
         }
-        let ppem = ppem_y as f64;
-        let upem = font.head()?.units_per_em() as f64;
-        let os2 = font.os2()?;
-        let hmtx = font.hmtx()?;
-        let num_base_glyphs = font.maxp()?.num_glyphs() as u32;
+        let ppem_px = f64::from(ppem);
+        let upem = f64::from(font.head().context("reading head table")?.units_per_em());
+        let os2 = font.os2().context("reading OS/2 table")?;
+
+        let BaseGlyphs {
+            mut glyphs,
+            mut cmap,
+            space,
+        } = self
+            .base_glyphs(&font, &cblc, &cbdt, strike)
+            .context("reading base glyphs")?;
+
+        let space_advance = space.map(|gid| glyphs.get(gid as usize).map_or(0, |g| g.advance));
+        let reference_advance = match space_advance {
+            Some(advance) if advance != 0 && !self.remove_original_symbols => f64::from(advance),
+            _ => upem,
+        };
+
+        let codepoints: Vec<u32> = if let Some(codepoints) = &self.codepoints {
+            if codepoints.iter().any(|cp| cmap.contains_key(cp)) {
+                bail!("requested codepoint is already mapped in the font");
+            }
+            codepoints.clone()
+        } else {
+            let available: Vec<u32> = (self.pua_start..=0xF8FF)
+                .filter(|cp| !cmap.contains_key(cp))
+                .take(images.len())
+                .collect();
+            if available.len() < images.len() {
+                bail!("not enough free Private Use Area code points");
+            }
+            available
+        };
+
+        let ascender_px = round_to_f64(f64::from(os2.s_typo_ascender()) * ppem_px / upem);
+        let descender_px = round_to_f64(f64::from(os2.s_typo_descender()).abs() * ppem_px / upem);
+        let metrics = IconMetrics {
+            ppem,
+            upem,
+            reference_advance,
+            line_center: (ascender_px - descender_px) / 2.0,
+        };
+
+        for (index, (png, &codepoint)) in images.iter().zip(&codepoints).enumerate() {
+            let name = names.get(index).map_or("image", String::as_str);
+            let size = raster::png_size(png).with_context(|| format!("reading size of {name}"))?;
+            if size != (u32::from(ppem), u32::from(ppem)) {
+                bail!(
+                    "image {name} is {}x{} but expected {ppem}x{ppem}",
+                    size.0,
+                    size.1
+                );
+            }
+            let advance_fraction = self
+                .advance_fractions
+                .as_ref()
+                .and_then(|f| f.get(index))
+                .copied()
+                .unwrap_or(1.0);
+            let drop_fraction = self
+                .drop_fractions
+                .as_ref()
+                .and_then(|f| f.get(index))
+                .copied()
+                .unwrap_or(0.0);
+            let glyph = icon_glyph(png, advance_fraction, drop_fraction, &metrics)
+                .with_context(|| format!("making glyph for {name}"))?;
+            let gid = u32::try_from(glyphs.len()).context("numbering glyphs")?;
+            cmap.insert(codepoint, gid);
+            glyphs.push(glyph);
+            log::debug!("[+] {name} -> U+{codepoint:04X}");
+        }
+
+        let tables = self
+            .build_tables(&font, &cblc, &glyphs, &cmap, &codepoints)
+            .context("building font tables")?;
+        Ok(BuiltFont {
+            data: assemble(&tables).context("assembling font")?,
+            codepoints,
+        })
+    }
+
+    /// The base font's glyphs that are carried over.
+    fn base_glyphs(
+        &self,
+        font: &FontRef,
+        cblc: &Cblc,
+        cbdt: &Cbdt,
+        strike: &BitmapSize,
+    ) -> Result<BaseGlyphs> {
+        let hmtx = font.hmtx().context("reading hmtx table")?;
+        let num_base_glyphs = u32::from(font.maxp().context("reading maxp table")?.num_glyphs());
         let base_advance = |gid: u32| {
             hmtx.advance(GlyphId::new(gid))
-                .or_else(|| hmtx.h_metrics().last().map(|m| m.advance()))
+                .or_else(|| hmtx.h_metrics().last().map(LongMetric::advance))
                 .unwrap_or(0)
         };
 
@@ -205,7 +347,6 @@ impl FontBuilder {
             .unwrap_or_default();
         let space = base_cmap.get(&0x20).copied();
 
-        // Base glyphs carried over, keeping their glyph ids.
         let mut glyphs: Vec<Glyph> = Vec::new();
         let mut cmap: BTreeMap<u32, u32> = BTreeMap::new();
         let base_bitmap = |gid: u32| -> Option<Vec<u8>> {
@@ -242,136 +383,96 @@ impl FontBuilder {
             }
             cmap.extend(base_cmap.iter());
         }
+        Ok(BaseGlyphs {
+            glyphs,
+            cmap,
+            space,
+        })
+    }
 
-        let space_advance = space.map(|gid| glyphs.get(gid as usize).map_or(0, |g| g.advance));
-        let reference_advance = match space_advance {
-            Some(advance) if advance != 0 && !self.remove_original_symbols => advance as f64,
-            _ => upem,
+    /// All tables of the output font, keyed by tag.
+    fn build_tables(
+        &self,
+        font: &FontRef,
+        cblc: &Cblc,
+        glyphs: &[Glyph],
+        cmap: &BTreeMap<u32, u32>,
+        codepoints: &[u32],
+    ) -> Result<BTreeMap<[u8; 4], Vec<u8>>> {
+        let Ok(num_glyphs) = u16::try_from(glyphs.len()) else {
+            bail!("too many glyphs for one font");
         };
-
-        let codepoints: Vec<u32> = match &self.codepoints {
-            Some(codepoints) => {
-                if codepoints.iter().any(|cp| cmap.contains_key(cp)) {
-                    bail!("Requested codepoint is already mapped in the font");
-                }
-                codepoints.clone()
-            }
-            None => {
-                let available: Vec<u32> = (self.pua_start..=0xF8FF)
-                    .filter(|cp| !cmap.contains_key(cp))
-                    .take(images.len())
-                    .collect();
-                if available.len() < images.len() {
-                    bail!("Not enough free Private Use Area code points");
-                }
-                available
-            }
-        };
-
-        let ascender_px = round(os2.s_typo_ascender() as f64 * ppem / upem) as f64;
-        let descender_px = round((os2.s_typo_descender() as f64).abs() * ppem / upem) as f64;
-        let line_center = (ascender_px - descender_px) / 2.0;
-
-        for (index, png) in images.iter().enumerate() {
-            let name = names.get(index).map(String::as_str).unwrap_or("image");
-            let size = raster::png_size(png)?;
-            if size != (ppem_y, ppem_y) {
-                bail!(
-                    "Image {name} is {}x{} but expected {ppem_y}x{ppem_y}",
-                    size.0,
-                    size.1
-                );
-            }
-            let advance_fraction = self
-                .advance_fractions
-                .as_ref()
-                .and_then(|f| f.get(index))
-                .copied()
-                .unwrap_or(1.0);
-            let drop_fraction = self
-                .drop_fractions
-                .as_ref()
-                .and_then(|f| f.get(index))
-                .copied()
-                .unwrap_or(0.0);
-            let advance = round(reference_advance * advance_fraction);
-            let advance_px = round(advance as f64 * ppem / upem);
-            let bearing_x = ((advance_px - ppem_y as i64) as f64 / 2.0)
-                .round_ties_even()
-                .max(0.0);
-            let bearing_y = line_center + ppem / 2.0 - drop_fraction * ppem;
-
-            let mut record = Vec::with_capacity(9 + png.len());
-            record.push(ppem_y as u8); // height
-            record.push(ppem_y as u8); // width
-            record.push(clamp_i8(bearing_x) as u8);
-            record.push(clamp_i8(bearing_y) as u8);
-            record.push(clamp_u8(advance_px as f64));
-            record.extend_from_slice(&(png.len() as u32).to_be_bytes());
-            record.extend_from_slice(png);
-
-            let codepoint = codepoints[index];
-            cmap.insert(codepoint, glyphs.len() as u32);
-            glyphs.push(Glyph {
-                advance: advance.clamp(0, u16::MAX as i64) as u16,
-                bitmap: Some(record),
-            });
-            log::debug!("[+] {name} -> U+{codepoint:04X}");
-        }
-        if glyphs.len() > u16::MAX as usize {
-            bail!("Too many glyphs for one font");
-        }
-
         let mut tables: BTreeMap<[u8; 4], Vec<u8>> = BTreeMap::new();
         let raw = |tag: &[u8; 4]| -> Result<Vec<u8>> {
             Ok(font
                 .table_data(Tag::new(tag))
-                .ok_or_else(|| anyhow!("Base font has no {} table", String::from_utf8_lossy(tag)))?
+                .with_context(|| {
+                    format!("base font has no {} table", String::from_utf8_lossy(tag))
+                })?
                 .as_bytes()
                 .to_vec())
         };
 
         let mut head = raw(b"head")?;
-        head[8..12].fill(0); // checkSumAdjustment, set once the font is assembled
+        head.get_mut(8..12)
+            .context("head table is truncated")?
+            .fill(0); // checkSumAdjustment, set once the font is assembled
         tables.insert(*b"head", head);
 
         let mut hhea = raw(b"hhea")?;
         let advance_max = glyphs.iter().map(|g| g.advance).max().unwrap_or(0);
-        hhea[10..12].copy_from_slice(&advance_max.to_be_bytes());
-        hhea[34..36].copy_from_slice(&(glyphs.len() as u16).to_be_bytes());
+        hhea.get_mut(10..12)
+            .context("hhea table is truncated")?
+            .copy_from_slice(&advance_max.to_be_bytes());
+        hhea.get_mut(34..36)
+            .context("hhea table is truncated")?
+            .copy_from_slice(&num_glyphs.to_be_bytes());
         tables.insert(*b"hhea", hhea);
 
         let mut maxp = raw(b"maxp")?;
-        maxp[4..6].copy_from_slice(&(glyphs.len() as u16).to_be_bytes());
+        maxp.get_mut(4..6)
+            .context("maxp table is truncated")?
+            .copy_from_slice(&num_glyphs.to_be_bytes());
         tables.insert(*b"maxp", maxp);
 
         let mut os2_data = raw(b"OS/2")?;
-        if os2_data.len() >= 68 {
-            let first = cmap.keys().next().copied().unwrap_or(0).min(0xFFFF) as u16;
-            let last = cmap.keys().last().copied().unwrap_or(0).min(0xFFFF) as u16;
-            os2_data[64..66].copy_from_slice(&first.to_be_bytes());
-            os2_data[66..68].copy_from_slice(&last.to_be_bytes());
+        if let Some(char_index_range) = os2_data.get_mut(64..68) {
+            let bmp =
+                |cp: Option<&u32>| u16::try_from(cp.copied().unwrap_or(0)).unwrap_or(u16::MAX);
+            let first = bmp(cmap.keys().next());
+            let last = bmp(cmap.keys().last());
+            char_index_range.copy_from_slice(&[first.to_be_bytes(), last.to_be_bytes()].concat());
         }
         tables.insert(*b"OS/2", os2_data);
 
         let mut post = raw(b"post")?;
         post.truncate(32);
-        post[0..4].copy_from_slice(&0x0003_0000u32.to_be_bytes());
+        post.get_mut(0..4)
+            .context("post table is truncated")?
+            .copy_from_slice(&0x0003_0000u32.to_be_bytes());
         tables.insert(*b"post", post);
 
         let mut hmtx_data = Vec::with_capacity(glyphs.len() * 4);
-        for glyph in &glyphs {
+        for glyph in glyphs {
             hmtx_data.extend_from_slice(&glyph.advance.to_be_bytes());
             hmtx_data.extend_from_slice(&0i16.to_be_bytes());
         }
         tables.insert(*b"hmtx", hmtx_data);
 
-        tables.insert(*b"cmap", build_cmap(&cmap));
-        tables.insert(*b"name", self.build_name(&codepoints));
+        tables.insert(*b"cmap", build_cmap(cmap).context("building cmap table")?);
+        tables.insert(
+            *b"name",
+            self.build_name(codepoints).context("building name table")?,
+        );
 
-        let cblc_data = cblc.offset_data().as_bytes();
-        let strike_record = cblc_data.get(8..56).context("Truncated CBLC table")?;
-        let (cblc_out, cbdt_out) = build_bitmap_tables(&glyphs, strike_record)?;
+        let strike_record = cblc
+            .offset_data()
+            .as_bytes()
+            .get(8..)
+            .and_then(<[u8]>::first_chunk)
+            .context("CBLC table is truncated")?;
+        let (cblc_out, cbdt_out) =
+            build_bitmap_tables(glyphs, strike_record).context("building bitmap tables")?;
         tables.insert(*b"CBLC", cblc_out);
         tables.insert(*b"CBDT", cbdt_out);
 
@@ -382,14 +483,10 @@ impl FontBuilder {
             // (e.g. emoji sequences) still apply.
             tables.insert(*b"GSUB", gsub.as_bytes().to_vec());
         }
-
-        Ok(BuiltFont {
-            data: assemble(tables),
-            codepoints,
-        })
+        Ok(tables)
     }
 
-    fn build_name(&self, codepoints: &[u32]) -> Vec<u8> {
+    fn build_name(&self, codepoints: &[u32]) -> Result<Vec<u8>> {
         let family = &self.family_name;
         let subfamily = "Regular";
         let sample: String = codepoints
@@ -422,35 +519,66 @@ impl FontBuilder {
     }
 }
 
+/// An icon glyph whose advance is `advance_fraction` of the reference
+/// advance and which is shifted down by `drop_fraction` of the em.
+fn icon_glyph(
+    png: &[u8],
+    advance_fraction: f64,
+    drop_fraction: f64,
+    metrics: &IconMetrics,
+) -> Result<Glyph> {
+    let ppem = f64::from(metrics.ppem);
+    let advance = round_to_f64(metrics.reference_advance * advance_fraction);
+    let advance_px = round_to_f64(advance * ppem / metrics.upem);
+    let bearing_x = ((advance_px - ppem) / 2.0).round_ties_even().max(0.0);
+    let bearing_y = metrics.line_center + ppem / 2.0 - drop_fraction * ppem;
+    let length = u32::try_from(png.len()).context("encoding PNG length")?;
+
+    let mut record = Vec::with_capacity(9 + png.len());
+    record.push(metrics.ppem); // height
+    record.push(metrics.ppem); // width
+    record.extend_from_slice(&clamp_i8(bearing_x).to_be_bytes());
+    record.extend_from_slice(&clamp_i8(bearing_y).to_be_bytes());
+    record.push(clamp_u8(advance_px));
+    record.extend_from_slice(&length.to_be_bytes());
+    record.extend_from_slice(png);
+    Ok(Glyph {
+        advance: clamp_u16(advance),
+        bitmap: Some(record),
+    })
+}
+
 /// A name table with each string for the Unicode and Windows platforms.
-fn build_name_table(names: &[(u16, String)]) -> Vec<u8> {
+fn build_name_table(names: &[(u16, String)]) -> Result<Vec<u8>> {
     let platforms: [(u16, u16, u16); 2] = [(0, 4, 0), (3, 1, 0x409)];
     let mut strings: Vec<u8> = Vec::new();
-    let mut offsets: HashMap<u16, (u16, u16)> = HashMap::new();
+    // (name id, length, offset) of each string.
+    let mut records: Vec<(u16, u16, u16)> = Vec::new();
     for (id, value) in names {
         let encoded: Vec<u8> = value.encode_utf16().flat_map(u16::to_be_bytes).collect();
-        offsets.insert(*id, (strings.len() as u16, encoded.len() as u16));
+        let offset = u16::try_from(strings.len()).context("placing name strings")?;
+        let length = u16::try_from(encoded.len()).with_context(|| format!("encoding name {id}"))?;
+        records.push((*id, length, offset));
         strings.extend(encoded);
     }
-    let count = (platforms.len() * names.len()) as u16;
+    let count = u16::try_from(platforms.len() * names.len()).context("counting name records")?;
     let mut table = Vec::new();
     table.extend_from_slice(&0u16.to_be_bytes());
     table.extend_from_slice(&count.to_be_bytes());
     table.extend_from_slice(&(6 + 12 * count).to_be_bytes());
     for (platform, encoding, language) in platforms {
-        for (id, _) in names {
-            let (offset, length) = offsets[id];
-            for value in [platform, encoding, language, *id, length, offset] {
+        for &(id, length, offset) in &records {
+            for value in [platform, encoding, language, id, length, offset] {
                 table.extend_from_slice(&value.to_be_bytes());
             }
         }
     }
     table.extend(strings);
-    table
+    Ok(table)
 }
 
 /// A cmap with one format 12 subtable covering every mapping.
-fn build_cmap(mapping: &BTreeMap<u32, u32>) -> Vec<u8> {
+fn build_cmap(mapping: &BTreeMap<u32, u32>) -> Result<Vec<u8>> {
     let mut groups: Vec<(u32, u32, u32)> = Vec::new();
     for (&codepoint, &gid) in mapping {
         if let Some(last) = groups.last_mut()
@@ -462,6 +590,7 @@ fn build_cmap(mapping: &BTreeMap<u32, u32>) -> Vec<u8> {
         }
         groups.push((codepoint, codepoint, gid));
     }
+    let num_groups = u32::try_from(groups.len()).context("counting cmap groups")?;
     let mut table = Vec::new();
     table.extend_from_slice(&0u16.to_be_bytes()); // version
     table.extend_from_slice(&1u16.to_be_bytes()); // numTables
@@ -470,35 +599,40 @@ fn build_cmap(mapping: &BTreeMap<u32, u32>) -> Vec<u8> {
     table.extend_from_slice(&12u32.to_be_bytes()); // subtable offset
     table.extend_from_slice(&12u16.to_be_bytes());
     table.extend_from_slice(&0u16.to_be_bytes());
-    table.extend_from_slice(&(16 + 12 * groups.len() as u32).to_be_bytes());
+    table.extend_from_slice(&(16 + 12 * num_groups).to_be_bytes());
     table.extend_from_slice(&0u32.to_be_bytes()); // language
-    table.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+    table.extend_from_slice(&num_groups.to_be_bytes());
     for (start, end, gid) in groups {
         for value in [start, end, gid] {
             table.extend_from_slice(&value.to_be_bytes());
         }
     }
-    table
+    Ok(table)
 }
 
 /// CBLC and CBDT tables with one strike and one index subtable (format 1)
 /// spanning all glyphs that have bitmaps. `strike_record` is the base
-/// font's BitmapSize record, whose line metrics and depth are kept.
-fn build_bitmap_tables(glyphs: &[Glyph], strike_record: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+/// font's `BitmapSize` record, whose line metrics and depth are kept.
+fn build_bitmap_tables(glyphs: &[Glyph], strike_record: &[u8; 48]) -> Result<(Vec<u8>, Vec<u8>)> {
     let first = glyphs
         .iter()
         .position(|g| g.bitmap.is_some())
-        .context("No bitmap glyphs")?;
-    let last = glyphs.iter().rposition(|g| g.bitmap.is_some()).unwrap();
+        .context("no bitmap glyphs")?;
+    let last = glyphs
+        .iter()
+        .rposition(|g| g.bitmap.is_some())
+        .context("no bitmap glyphs")?;
+    let first_gid = u16::try_from(first).context("numbering first bitmap glyph")?;
+    let last_gid = u16::try_from(last).context("numbering last bitmap glyph")?;
 
     let mut cbdt = vec![0, 3, 0, 0]; // version 3.0
-    let image_data_offset = cbdt.len() as u32;
+    let image_data_offset = 4u32; // right after the version
     let mut offsets = vec![0u32];
-    for glyph in &glyphs[first..=last] {
+    for glyph in glyphs.iter().take(last + 1).skip(first) {
         if let Some(bitmap) = &glyph.bitmap {
             cbdt.extend_from_slice(bitmap);
         }
-        offsets.push(cbdt.len() as u32 - image_data_offset);
+        offsets.push(u32::try_from(cbdt.len()).context("placing bitmaps")? - image_data_offset);
     }
 
     let mut subtable = Vec::new();
@@ -509,20 +643,21 @@ fn build_bitmap_tables(glyphs: &[Glyph], strike_record: &[u8]) -> Result<(Vec<u8
         subtable.extend_from_slice(&offset.to_be_bytes());
     }
     let mut index = Vec::new();
-    index.extend_from_slice(&(first as u16).to_be_bytes());
-    index.extend_from_slice(&(last as u16).to_be_bytes());
+    index.extend_from_slice(&first_gid.to_be_bytes());
+    index.extend_from_slice(&last_gid.to_be_bytes());
     index.extend_from_slice(&8u32.to_be_bytes()); // offset from the array start
     index.extend(subtable);
+    let index_length = u32::try_from(index.len()).context("measuring index subtables")?;
 
     let mut cblc = Vec::new();
     cblc.extend_from_slice(&[0, 3, 0, 0]); // version 3.0
     cblc.extend_from_slice(&1u32.to_be_bytes()); // numSizes
-    let mut record = strike_record.to_vec();
+    let mut record = *strike_record;
     record[0..4].copy_from_slice(&56u32.to_be_bytes()); // indexSubTableArrayOffset
-    record[4..8].copy_from_slice(&(index.len() as u32).to_be_bytes());
+    record[4..8].copy_from_slice(&index_length.to_be_bytes());
     record[8..12].copy_from_slice(&1u32.to_be_bytes()); // numberOfIndexSubTables
-    record[40..42].copy_from_slice(&(first as u16).to_be_bytes());
-    record[42..44].copy_from_slice(&(last as u16).to_be_bytes());
+    record[40..42].copy_from_slice(&first_gid.to_be_bytes());
+    record[42..44].copy_from_slice(&last_gid.to_be_bytes());
     cblc.extend(record);
     cblc.extend(index);
     Ok((cblc, cbdt))
@@ -531,36 +666,47 @@ fn build_bitmap_tables(glyphs: &[Glyph], strike_record: &[u8]) -> Result<(Vec<u8
 fn checksum(data: &[u8]) -> u32 {
     data.chunks(4).fold(0u32, |sum, chunk| {
         let mut word = [0u8; 4];
-        word[..chunk.len()].copy_from_slice(chunk);
+        for (target, byte) in word.iter_mut().zip(chunk) {
+            *target = *byte;
+        }
         sum.wrapping_add(u32::from_be_bytes(word))
     })
 }
 
 /// Lay out tables (sorted by tag) into an sfnt file.
-fn assemble(tables: BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
-    let count = tables.len() as u16;
-    let entry_selector = 15 - count.leading_zeros() as u16;
+fn assemble(tables: &BTreeMap<[u8; 4], Vec<u8>>) -> Result<Vec<u8>> {
+    let count = u16::try_from(tables.len()).context("counting tables")?;
+    let entry_selector = count.checked_ilog2().context("font has no tables")?;
     let search_range = (1u16 << entry_selector) * 16;
     let mut font = Vec::new();
     font.extend_from_slice(&0x0001_0000u32.to_be_bytes());
     for value in [
         count,
         search_range,
-        entry_selector,
+        u16::try_from(entry_selector).context("encoding entrySelector")?,
         count * 16 - search_range,
     ] {
         font.extend_from_slice(&value.to_be_bytes());
     }
     let mut offset = 12 + 16 * tables.len();
     let mut head_offset = 0;
-    for (tag, data) in &tables {
+    for (tag, data) in tables {
         if tag == b"head" {
             head_offset = offset;
         }
+        let tag_name = String::from_utf8_lossy(tag);
         font.extend_from_slice(tag);
         font.extend_from_slice(&checksum(data).to_be_bytes());
-        font.extend_from_slice(&(offset as u32).to_be_bytes());
-        font.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        font.extend_from_slice(
+            &u32::try_from(offset)
+                .with_context(|| format!("placing {tag_name} table"))?
+                .to_be_bytes(),
+        );
+        font.extend_from_slice(
+            &u32::try_from(data.len())
+                .with_context(|| format!("measuring {tag_name} table"))?
+                .to_be_bytes(),
+        );
         offset += data.len().next_multiple_of(4);
     }
     for data in tables.values() {
@@ -568,8 +714,10 @@ fn assemble(tables: BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
         font.resize(font.len().next_multiple_of(4), 0);
     }
     let adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(&font));
-    font[head_offset + 8..head_offset + 12].copy_from_slice(&adjustment.to_be_bytes());
-    font
+    font.get_mut(head_offset + 8..head_offset + 12)
+        .context("head table is truncated")?
+        .copy_from_slice(&adjustment.to_be_bytes());
+    Ok(font)
 }
 
 /// What an installed font provides, as far as the daemon is concerned.
@@ -592,19 +740,19 @@ fn name_string(font: &FontRef, name_id: u16) -> Option<String> {
 }
 
 pub fn read_font_info(path: &Path) -> Result<FontInfo> {
-    let data = std::fs::read(path)?;
-    let font = FontRef::new(&data)?;
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let font = FontRef::new(&data).with_context(|| format!("parsing {}", path.display()))?;
     let mut info = FontInfo {
         family: name_string(&font, 1),
         version: name_string(&font, 5),
         ..Default::default()
     };
-    let cblc = font.cblc()?;
+    let cblc = font.cblc().context("reading CBLC table")?;
     let strike = cblc
         .bitmap_sizes()
         .first()
-        .context("Font has no bitmap strike")?;
-    let Some((_, _, cmap)) = font.cmap()?.best_subtable() else {
+        .context("font has no bitmap strike")?;
+    let Some((_, _, cmap)) = font.cmap().context("reading cmap table")?.best_subtable() else {
         return Ok(info);
     };
     for (codepoint, gid) in cmap.iter() {
@@ -742,7 +890,7 @@ mod tests {
         write_png(&icon, 109, [0, 255, 0, 255]);
         let builder = FontBuilder {
             remove_original_symbols: true,
-            codepoints: Some(vec![0xEC00, 0x10B000]),
+            codepoints: Some(vec![0xEC00, 0x0010_B000]),
             advance_fractions: Some(vec![1.0, 0.5]),
             drop_fractions: Some(vec![0.0, 0.08]),
             ..Default::default()
@@ -762,7 +910,7 @@ mod tests {
             (m.height, m.width, m.bearing_x(), m.bearing_y(), m.advance)
         };
         assert_eq!(metrics(0xEC00), (109, 109, 0, 92, 109));
-        assert_eq!(metrics(0x10B000), (109, 109, 0, 83, 54));
+        assert_eq!(metrics(0x0010_B000), (109, 109, 0, 83, 54));
         let hmtx = font.hmtx().unwrap();
         assert_eq!(hmtx.advance(GlyphId::new(2)), Some(2048));
         assert_eq!(hmtx.advance(GlyphId::new(3)), Some(1024));

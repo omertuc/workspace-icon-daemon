@@ -70,17 +70,24 @@ impl FontInstaller {
         if !source.is_file() {
             bail!("Font file does not exist: {}", source.display());
         }
-        fs::create_dir_all(&self.fonts_dir)?;
-        let name = source.file_name().context("Font path has no file name")?;
+        fs::create_dir_all(&self.fonts_dir)
+            .with_context(|| format!("creating {}", self.fonts_dir.display()))?;
+        let name = source.file_name().context("font path has no file name")?;
         let destination = self.fonts_dir.join(name);
         // Do not truncate a font file while a renderer may have it mmap'ed.
         // Publish a fully written replacement as a new inode instead.
         let temporary = tempfile::Builder::new()
             .prefix(&format!(".{}.", name.to_string_lossy()))
-            .tempfile_in(&self.fonts_dir)?;
-        fs::copy(source, temporary.path())?;
-        temporary.persist(&destination)?;
-        refresh_font_cache(&self.fonts_dir)?;
+            .tempfile_in(&self.fonts_dir)
+            .with_context(|| {
+                format!("creating a temporary file in {}", self.fonts_dir.display())
+            })?;
+        fs::copy(source, temporary.path())
+            .with_context(|| format!("copying {}", source.display()))?;
+        temporary
+            .persist(&destination)
+            .with_context(|| format!("replacing {}", destination.display()))?;
+        refresh_font_cache(&self.fonts_dir).context("refreshing the font cache")?;
         log::info!("Installed icon font at {}", destination.display());
         Ok(destination)
     }
@@ -93,7 +100,7 @@ pub fn refresh_font_cache(fonts_dir: &Path) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("Running fc-cache")?;
+        .context("running fc-cache")?;
     if !status.success() {
         bail!("fc-cache failed: {status}");
     }
@@ -166,7 +173,7 @@ mod tests {
         assert_eq!(fs::read(installed).unwrap(), b"new");
         let leftovers: Vec<_> = fs::read_dir(&fonts)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftovers.is_empty());

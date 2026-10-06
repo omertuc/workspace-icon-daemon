@@ -5,7 +5,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use image::imageops::{self, FilterType};
 use image::{ImageFormat, Rgba, RgbaImage};
 use resvg::{tiny_skia, usvg};
@@ -49,7 +49,7 @@ fn parse_svg(
     data: &[u8],
     resources_dir: Option<&Path>,
     style_sheet: Option<&str>,
-) -> Result<usvg::Tree> {
+) -> Result<usvg::Tree, usvg::Error> {
     let options = usvg::Options {
         resources_dir: resources_dir.map(Path::to_path_buf),
         fontdb: fontdb(),
@@ -57,7 +57,7 @@ fn parse_svg(
         style_sheet: style_sheet.map(str::to_string),
         ..Default::default()
     };
-    Ok(usvg::Tree::from_data(data, &options)?)
+    usvg::Tree::from_data(data, &options)
 }
 
 fn pixmap_to_image(pixmap: &tiny_skia::Pixmap) -> RgbaImage {
@@ -87,41 +87,49 @@ pub fn render_svg_styled(
     resources_dir: Option<&Path>,
     style_sheet: Option<&str>,
 ) -> Result<RgbaImage> {
-    let tree = parse_svg(data, resources_dir, style_sheet)?;
+    let tree = parse_svg(data, resources_dir, style_sheet).context("parsing SVG")?;
     let size = tree.size();
-    let scale = (width as f32 / size.width()).min(height as f32 / size.height());
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "raster dimensions are far below 2^24"
+    )]
+    let (width_f, height_f) = (width as f32, height as f32);
+    let scale = (width_f / size.width()).min(height_f / size.height());
     let transform = tiny_skia::Transform::from_translate(
-        (width as f32 - size.width() * scale) / 2.0,
-        (height as f32 - size.height() * scale) / 2.0,
+        (width_f - size.width() * scale) / 2.0,
+        (height_f - size.height() * scale) / 2.0,
     )
     .pre_scale(scale, scale);
-    let mut pixmap = tiny_skia::Pixmap::new(width, height).context("Empty SVG raster")?;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).context("empty SVG raster")?;
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     Ok(pixmap_to_image(&pixmap))
 }
 
 pub fn render_svg_file(path: &Path, width: u32, height: u32) -> Result<RgbaImage> {
-    let data = std::fs::read(path)?;
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     render_svg(&data, width, height, path.parent())
-        .with_context(|| format!("Rendering {}", path.display()))
+        .with_context(|| format!("rendering {}", path.display()))
 }
 
 /// Decode a raster image (PNG, ICO, JPEG, GIF, WebP, BMP). For an ICO this
 /// is its largest image.
 pub fn decode(data: &[u8]) -> Result<RgbaImage> {
-    Ok(image::load_from_memory(data)?.to_rgba8())
+    Ok(image::load_from_memory(data)
+        .context("decoding image")?
+        .to_rgba8())
 }
 
-pub fn encode_png(image: &RgbaImage) -> Vec<u8> {
+pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
     let mut buffer = Cursor::new(Vec::new());
     image
         .write_to(&mut buffer, ImageFormat::Png)
-        .expect("PNG encoding to memory cannot fail");
-    buffer.into_inner()
+        .context("encoding PNG")?;
+    Ok(buffer.into_inner())
 }
 
 pub fn save_png(image: &RgbaImage, path: &Path) -> Result<()> {
-    std::fs::write(path, encode_png(image)).with_context(|| format!("Writing {}", path.display()))
+    let data = encode_png(image).context("encoding image")?;
+    std::fs::write(path, data).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The (width, height) of PNG data, read from its header.
@@ -130,14 +138,17 @@ pub fn png_size(data: &[u8]) -> Result<(u32, u32)> {
     let index = data
         .windows(SIGNATURE.len())
         .position(|window| window == SIGNATURE)
-        .ok_or_else(|| anyhow!("Not a PNG"))?;
-    let start = index + 8;
-    if data.len() < start + 24 {
-        bail!("Truncated PNG");
-    }
-    let width = u32::from_be_bytes(data[start + 8..start + 12].try_into().unwrap());
-    let height = u32::from_be_bytes(data[start + 12..start + 16].try_into().unwrap());
-    Ok((width, height))
+        .context("not a PNG")?;
+    // The IHDR chunk: length, type, width, height and more.
+    let ihdr: &[u8; 24] = data
+        .get(index + 8..)
+        .and_then(<[u8]>::first_chunk)
+        .context("truncated PNG")?;
+    let [_, _, _, _, _, _, _, _, w0, w1, w2, w3, h0, h1, h2, h3, ..] = *ihdr;
+    Ok((
+        u32::from_be_bytes([w0, w1, w2, w3]),
+        u32::from_be_bytes([h0, h1, h2, h3]),
+    ))
 }
 
 fn extension(path: &Path) -> String {
@@ -150,7 +161,7 @@ pub fn is_svg(path: &Path) -> bool {
     extension(path) == "svg"
 }
 
-/// A PNG or SVG file as PNG data of target_px x target_px pixels. PNGs of
+/// A PNG or SVG file as PNG data of `target_px` x `target_px` pixels. PNGs of
 /// the right size are passed through untouched.
 pub fn collect_image(path: &Path, target_px: u32) -> Result<Vec<u8>> {
     if !path.is_file() {
@@ -158,8 +169,10 @@ pub fn collect_image(path: &Path, target_px: u32) -> Result<Vec<u8>> {
     }
     match extension(path).as_str() {
         "png" => {
-            let data = std::fs::read(path)?;
-            let (width, height) = png_size(&data)?;
+            let data =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let (width, height) =
+                png_size(&data).with_context(|| format!("reading size of {}", path.display()))?;
             if (width, height) == (target_px, target_px) {
                 return Ok(data);
             }
@@ -167,11 +180,15 @@ pub fn collect_image(path: &Path, target_px: u32) -> Result<Vec<u8>> {
                 "{}: PNG is {width}x{height}; rescaling to {target_px}x{target_px}",
                 path.display()
             );
-            let image = decode(&data)?;
+            let image = decode(&data).with_context(|| format!("decoding {}", path.display()))?;
             let resized = imageops::resize(&image, target_px, target_px, FilterType::Lanczos3);
-            Ok(encode_png(&resized))
+            encode_png(&resized)
         }
-        "svg" => Ok(encode_png(&render_svg_file(path, target_px, target_px)?)),
+        "svg" => {
+            let image =
+                render_svg_file(path, target_px, target_px).context("rasterizing SVG icon")?;
+            encode_png(&image)
+        }
         _ => bail!("Not a PNG or SVG file: {}", path.display()),
     }
 }
@@ -200,10 +217,13 @@ pub fn dilate(mask: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8
             for i in 0..length {
                 let low = i.saturating_sub(radius);
                 let high = (i + radius).min(length - 1);
-                target[base + i * step] = (low..=high)
-                    .map(|j| source[base + j * step])
-                    .max()
-                    .unwrap_or(0);
+                if let Some(value) = target.get_mut(base + i * step) {
+                    *value = (low..=high)
+                        .filter_map(|j| source.get(base + j * step))
+                        .copied()
+                        .max()
+                        .unwrap_or(0);
+                }
             }
         }
         target

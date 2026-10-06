@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -29,15 +29,15 @@ use crate::xdg::APP_NAME;
 pub const DEFAULT_FONT_FAMILY_NAME: &str = "WorkspaceIconDaemon";
 /// Half-size top/bottom/middle copies of each icon, for stacking: slots
 /// 0-1023 mirror the application range, the rest mirror favicons.
-const STACK_TOP_START: u32 = 0x108000;
-const STACK_BOTTOM_START: u32 = 0x10B000;
-const STACK_MIDDLE_START: u32 = 0x10E000;
+const STACK_TOP_START: u32 = 0x0010_8000;
+const STACK_BOTTOM_START: u32 = 0x0010_B000;
+const STACK_MIDDLE_START: u32 = 0x0010_E000;
 const STACK_SLOTS: u32 = 0x1FF0; // The middle range is the smallest.
 /// Zero-width layout lines drawn over icons: under each tabbed icon, above
 /// each stacked column, and between the halves of a vertical split's column.
-const TAB_UNDERLINE_CODEPOINT: u32 = 0x10FFF0;
-const STACK_OVERLINE_CODEPOINT: u32 = 0x10FFF1;
-const SPLIT_LINE_CODEPOINT: u32 = 0x10FFF2;
+const TAB_UNDERLINE_CODEPOINT: u32 = 0x0010_FFF0;
+const STACK_OVERLINE_CODEPOINT: u32 = 0x0010_FFF1;
+const SPLIT_LINE_CODEPOINT: u32 = 0x0010_FFF2;
 const TAB_UNDERLINE_DROP: f64 = 0.12;
 /// Background behind the focused window's icon in layout titles.
 const FOCUS_HIGHLIGHT: &str = "#719cd666";
@@ -78,7 +78,7 @@ const STACK_SCALE: f64 = 1.3;
 /// How many of the most visited sites get a favicon baked into the font up front.
 const FAVICON_TOP_SITES: usize = 300;
 /// Delay before rebuilding the font for newly seen sites, to batch them.
-const FAVICON_REBUILD_DELAY: Duration = Duration::from_secs(120);
+const FAVICON_REBUILD_DELAY: Duration = Duration::from_mins(2);
 const FAVICON_BADGE_PROGRAMS: [&str; 3] = ["org.mozilla.firefox", "firefox", "firefox-esr"];
 /// Terminals whose foreground job (e.g. nvim) gets its own icon, badged with
 /// the terminal's.
@@ -124,14 +124,13 @@ static CLOCK_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Codepoints of an icon's top, bottom and middle stacking glyphs.
 pub fn stacked_codepoints(codepoint: u32) -> Option<(u32, u32, u32)> {
     let slot = if codepoint >= FAVICON_PUA_START {
-        1024 + (codepoint - FAVICON_PUA_START) as i64
+        1024 + i64::from(codepoint - FAVICON_PUA_START)
     } else {
-        codepoint as i64 - PUA_START as i64
+        i64::from(codepoint) - i64::from(PUA_START)
     };
-    if !(0..STACK_SLOTS as i64).contains(&slot) {
-        return None;
-    }
-    let slot = slot as u32;
+    let slot = u32::try_from(slot)
+        .ok()
+        .filter(|slot| *slot < STACK_SLOTS)?;
     Some((
         STACK_TOP_START + slot,
         STACK_BOTTOM_START + slot,
@@ -183,7 +182,12 @@ fn format_g(value: f64) -> String {
     if value == 0.0 {
         return "0".to_string();
     }
-    let decimals = (5 - value.abs().log10().floor() as i32).max(0) as usize;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a finite f64's log10 is within ±324"
+    )]
+    let magnitude = value.abs().log10().floor() as i32;
+    let decimals = usize::try_from((5 - magnitude).max(0)).unwrap_or_default();
     let text = format!("{value:.decimals$}");
     if text.contains('.') {
         text.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -220,9 +224,12 @@ pub struct FontJob {
 
 impl FontJob {
     pub fn run(self) -> Result<()> {
-        let _build = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        create_icon_font(&self.icons, self.base_font, &self.output, &self.family)?;
-        self.installer.install(&self.output)?;
+        let _build = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        create_icon_font(&self.icons, self.base_font, &self.output, &self.family)
+            .context("creating icon font")?;
+        self.installer
+            .install(&self.output)
+            .with_context(|| format!("installing {}", self.output.display()))?;
         Ok(())
     }
 }
@@ -258,7 +265,10 @@ pub fn create_icon_font(
         ("over", "stacked", STACK_OVERLINE_CODEPOINT, STACK_DROP),
         ("between", "splitv", SPLIT_LINE_CODEPOINT, STACK_DROP),
     ] {
-        paths.push(line_icon(&stacked_dir, position, layout_color(layout))?);
+        paths.push(
+            line_icon(&stacked_dir, position, layout_color(layout))
+                .with_context(|| format!("creating {position} line icon"))?,
+        );
         codepoints.push(codepoint);
         advances.push(0.0);
         drops.push(drop);
@@ -286,12 +296,17 @@ pub fn create_icon_font(
         drop_fractions: Some(drops),
         version: Some(FONT_LAYOUT_VERSION.to_string()),
     };
-    let built = builder.build(base_font, &paths)?;
+    let built = builder.build(base_font, &paths).context("building font")?;
     let directory = output.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(directory)?;
-    let temporary = tempfile::NamedTempFile::new_in(directory)?;
-    std::fs::write(temporary.path(), &built.data)?;
-    temporary.persist(output)?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let temporary = tempfile::NamedTempFile::new_in(directory)
+        .with_context(|| format!("creating temporary file in {}", directory.display()))?;
+    std::fs::write(temporary.path(), &built.data)
+        .with_context(|| format!("writing {}", temporary.path().display()))?;
+    temporary
+        .persist(output)
+        .with_context(|| format!("moving font to {}", output.display()))?;
     log::info!(
         "Wrote {} with {} glyphs",
         output.display(),
@@ -338,7 +353,13 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(ipc: Box<dyn Ipc>, settings: Settings) -> Result<Self> {
-        let program_icon_map = ProgramIconMap::load(&settings.program_icon_map_path)?;
+        let program_icon_map =
+            ProgramIconMap::load(&settings.program_icon_map_path).with_context(|| {
+                format!(
+                    "loading program icon map {}",
+                    settings.program_icon_map_path.display()
+                )
+            })?;
         let cache_dir = settings
             .font_output_path
             .parent()
@@ -442,12 +463,15 @@ impl Daemon {
             for program in missing {
                 let (added, _) = self
                     .program_icon_map
-                    .add_program(&program, icon_path.as_deref())?;
+                    .add_program(&program, icon_path.as_deref())
+                    .with_context(|| format!("adding program {program}"))?;
                 added_any |= added;
             }
         }
         if added_any {
-            self.program_icon_map.save()?;
+            self.program_icon_map
+                .save()
+                .context("saving program icon map")?;
         }
         log::info!("Discovered {} installed applications", desktop_files.len());
         Ok(added_any)
@@ -467,7 +491,8 @@ impl Daemon {
             }
             let (added, _) = self
                 .program_icon_map
-                .add_program(program, icon_path.as_deref())?;
+                .add_program(program, icon_path.as_deref())
+                .with_context(|| format!("adding program {program}"))?;
             added_any |= added;
         }
         Ok(added_any)
@@ -475,7 +500,7 @@ impl Daemon {
 
     /// Discover programs represented by currently open windows.
     pub fn add_running_programs(&mut self) -> Result<bool> {
-        let tree = self.ipc.get_tree()?;
+        let tree = self.ipc.get_tree().context("getting window tree")?;
         let programs: std::collections::BTreeSet<String> = self
             .programs_by_workspace(&tree)
             .into_iter()
@@ -488,9 +513,13 @@ impl Daemon {
         if missing.is_empty() {
             return Ok(false);
         }
-        let added = self.add_missing_programs(&missing)?;
+        let added = self
+            .add_missing_programs(&missing)
+            .context("adding missing programs")?;
         if added {
-            self.program_icon_map.save()?;
+            self.program_icon_map
+                .save()
+                .context("saving program icon map")?;
         }
         Ok(added)
     }
@@ -498,11 +527,15 @@ impl Daemon {
     /// Check open windows for new programs, and install a font with their
     /// icons for the next session.
     pub fn process_new_programs(&mut self) -> Result<bool> {
-        if !self.add_running_programs()? {
+        if !self
+            .add_running_programs()
+            .context("adding running programs")?
+        {
             log::debug!("No new programs detected; skipping font rebuild");
             return Ok(false);
         }
-        self.publish_font_update(true)?;
+        self.publish_font_update(true)
+            .context("publishing font update")?;
         Ok(true)
     }
 
@@ -518,7 +551,7 @@ impl Daemon {
 
     /// Build and install a font which will become active next session.
     pub fn publish_font_update(&mut self, new_application: bool) -> Result<()> {
-        self.font_job().run()?;
+        self.font_job().run().context("running font job")?;
         if new_application {
             (self.notifier)(
                 "WorkspaceIconDaemon: New application icon installed",
@@ -549,19 +582,19 @@ impl Daemon {
         if !self.settings.workspace_icons {
             return Ok(());
         }
-        let tree = self.ipc.get_tree()?;
+        let tree = self.ipc.get_tree().context("getting window tree")?;
         for workspace in tree.workspaces() {
             let mut windows = workspace.leaves();
             Self::sort_windows_by_layout(&mut windows);
-            let mut icons: Vec<String> = Vec::new();
+            let mut icons: Vec<(String, bool)> = Vec::new();
             for window in windows {
                 if Self::is_ignored(self.window_name(window).as_deref()) {
                     continue;
                 }
-                if let Some(codepoint) = self.window_unicode_id(window)
+                if let Some((codepoint, working)) = self.window_icon(window)
                     && let Some(c) = char::from_u32(codepoint)
                 {
-                    icons.push(c.to_string());
+                    icons.push((c.to_string(), working));
                 }
             }
             let processed = self.process_icons(icons);
@@ -571,7 +604,10 @@ impl Daemon {
                 Some(&self.workspace_base_name(workspace.name())),
             );
             if new_name != workspace.name() {
-                self.rename_workspace(workspace.name(), &new_name)?;
+                self.rename_workspace(workspace.name(), &new_name)
+                    .with_context(|| {
+                        format!("renaming workspace {:?} to {new_name:?}", workspace.name())
+                    })?;
             }
         }
         Ok(())
@@ -585,7 +621,7 @@ impl Daemon {
             .flatten()
             .filter_map(|e| e.file_name().to_str()?.parse().ok())
             .collect();
-        tasks.sort();
+        tasks.sort_unstable();
         let mut children = tasks.iter().flat_map(|task| {
             std::fs::read_to_string(format!("/proc/{pid}/task/{task}/children"))
                 .unwrap_or_default()
@@ -611,17 +647,24 @@ impl Daemon {
         (!comm.is_empty()).then(|| comm.to_string())
     }
 
-    /// Animation frame of a working job's icon, or 0 when it is idle.
+    /// Animation frame of a working job's icon, or None when it is idle.
     ///
     /// Frames come from the clock rather than from the title's spinner,
     /// which e.g. Claude Code stops updating while its terminal is unfocused.
-    fn spinner_frame(&mut self, window: &Node, job: &str) -> u64 {
+    fn spinner_frame(&mut self, window: &Node, job: &str) -> Option<u64> {
         let first = window.name().chars().next();
         if !first.is_some_and(|c| job_spinner(job).contains(&c)) {
-            return 0;
+            return None;
         }
         self.animating = true;
-        (CLOCK_START.elapsed().as_millis() / ANIMATION_FRAME.as_millis()) as u64 % JOB_FRAMES
+        let frame = CLOCK_START.elapsed().as_millis() / ANIMATION_FRAME.as_millis()
+            % u128::from(JOB_FRAMES);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the frame is below JOB_FRAMES"
+        )]
+        let frame = frame as u64;
+        Some(frame)
     }
 
     /// Redraw icons for the next animation frame while any job is working.
@@ -632,7 +675,7 @@ impl Daemon {
         self.animating = false; // Set again by any still-working job.
         if let Err(error) = self
             .update_workspace_names()
-            .and_then(|_| self.update_window_titles())
+            .and_then(|()| self.update_window_titles())
         {
             log::debug!("Animation update failed: {error:#}");
         }
@@ -659,14 +702,17 @@ impl Daemon {
         }
         let icon_path = self.job_icon(job, terminal);
         self.program_icon_map
-            .add_program(&program, icon_path.as_deref())?;
-        self.program_icon_map.save()?;
+            .add_program(&program, icon_path.as_deref())
+            .with_context(|| format!("adding job {program}"))?;
+        self.program_icon_map
+            .save()
+            .context("saving program icon map")?;
         Ok(icon_path.is_some())
     }
 
     pub fn add_preset_jobs(&mut self) -> Result<bool> {
         // Badge with the terminal in use, or else the first one installed.
-        let tree = self.ipc.get_tree()?;
+        let tree = self.ipc.get_tree().context("getting window tree")?;
         let running: HashSet<String> = tree
             .leaves()
             .iter()
@@ -682,7 +728,9 @@ impl Daemon {
         };
         let mut added = false;
         for job in PRESET_JOBS {
-            added |= self.add_job(job, terminal)?;
+            added |= self
+                .add_job(job, terminal)
+                .with_context(|| format!("adding preset job {job}"))?;
         }
         Ok(added)
     }
@@ -691,13 +739,19 @@ impl Daemon {
     /// icon of its foreground job if it is a terminal, otherwise its
     /// application icon.
     fn window_unicode_id(&mut self, window: &Node) -> Option<u32> {
+        self.window_icon(window).map(|(codepoint, _)| codepoint)
+    }
+
+    /// The window's icon, and whether it is a working job's animated icon.
+    fn window_icon(&mut self, window: &Node) -> Option<(u32, bool)> {
         let program = self.window_name(window)?;
         if TERMINAL_PROGRAMS.contains(&program.as_str())
             && let Some(mut job) = Self::terminal_job(window)
         {
             let frame = self.spinner_frame(window, &job);
             // Frames missing from the loaded font fall back to the icon at rest.
-            if frame != 0
+            if let Some(frame) = frame
+                && frame != 0
                 && self
                     .active_program_codepoints
                     .contains_key(&format!("{JOB_PREFIX}{job}@{frame}"))
@@ -708,7 +762,7 @@ impl Daemon {
                 .active_program_codepoints
                 .get(&format!("{JOB_PREFIX}{job}"))
             {
-                return Some(codepoint);
+                return Some((codepoint, frame.is_some()));
             }
             match self.add_job(&job, &program) {
                 Ok(true) => self.schedule_font_rebuild(),
@@ -723,13 +777,14 @@ impl Daemon {
         {
             let favicon = favicon_program(&host);
             if let Some(&codepoint) = self.active_program_codepoints.get(&favicon) {
-                return Some(codepoint);
+                return Some((codepoint, false));
             }
             if !self.program_icon_map.contains(&favicon) {
                 self.add_favicon_later(&host);
             }
         }
         self.active_unicode_id(&program)
+            .map(|codepoint| (codepoint, false))
     }
 
     /// Icon overlaid on favicons to show which browser a window is.
@@ -764,7 +819,8 @@ impl Daemon {
         }
         // Sites without a favicon are remembered so they are not looked up again.
         self.program_icon_map
-            .add_program(&program, icon_path.as_deref())?;
+            .add_program(&program, icon_path.as_deref())
+            .with_context(|| format!("adding favicon {program}"))?;
         Ok(icon_path.is_some())
     }
 
@@ -783,9 +839,14 @@ impl Daemon {
         }
         let mut changed = 0;
         for host in hosts {
-            changed += self.add_favicon(&host)? as usize;
+            changed += usize::from(
+                self.add_favicon(&host)
+                    .with_context(|| format!("adding favicon for {host}"))?,
+            );
         }
-        self.program_icon_map.save()?;
+        self.program_icon_map
+            .save()
+            .context("saving program icon map")?;
         log::info!("Added or updated {changed} site favicons");
         Ok(changed > 0)
     }
@@ -842,7 +903,7 @@ impl Daemon {
         }
         self.title_font_size();
         let family = escape(&self.settings.font_family_name);
-        let tree = self.ipc.get_tree()?;
+        let tree = self.ipc.get_tree().context("getting window tree")?;
         let mut visible: HashSet<i64> = HashSet::new();
         for window in tree.leaves() {
             let Some(codepoint) = self.window_unicode_id(window) else {
@@ -863,10 +924,12 @@ impl Daemon {
             // Record this before sending the command: changing title_format
             // may itself cause a window::title event on some compositor versions.
             self.titlebar_icon_codepoints.insert(window.id, codepoint);
-            self.ipc.command(&format!(
-                "[con_id={}] title_format \"{title_format}\"",
-                window.id
-            ))?;
+            self.ipc
+                .command(&format!(
+                    "[con_id={}] title_format \"{title_format}\"",
+                    window.id
+                ))
+                .with_context(|| format!("setting title format of window {}", window.id))?;
         }
         self.titlebar_icon_codepoints
             .retain(|id, _| visible.contains(id));
@@ -875,7 +938,7 @@ impl Daemon {
 
     /// The non-window containers nested inside workspaces.
     fn split_containers(&mut self) -> Result<Vec<Node>> {
-        let tree = self.ipc.get_tree()?;
+        let tree = self.ipc.get_tree().context("getting window tree")?;
         Ok(tree
             .workspaces()
             .into_iter()
@@ -901,8 +964,8 @@ impl Daemon {
                 None => escape(self.window_name(con).as_deref().unwrap_or("?")),
             };
         }
-        if con.nodes.len() == 1 {
-            return self.container_representation(&con.nodes[0], family, nested, underline);
+        if let [only] = con.nodes.as_slice() {
+            return self.container_representation(only, family, nested, underline);
         }
         if let Some(stacked) = self.stacked_icons(con, family) {
             return stacked;
@@ -961,17 +1024,15 @@ impl Daemon {
             String::new()
         };
         let mut columns = String::new();
-        for index in (0..stacked.len()).step_by(2) {
-            let mut column = if index + 1 < stacked.len() {
-                let (top, bottom) = (stacked[index].0, stacked[index + 1].1);
-                format!("{over}{}{between}{}", glyph(top), glyph(bottom))
-            } else {
-                format!("{over}{}", glyph(stacked[index].2))
+        for (pair, children) in stacked.chunks(2).zip(con.nodes.chunks(2)) {
+            let mut column = match pair {
+                [(top, _, _), (_, bottom, _)] => {
+                    format!("{over}{}{between}{}", glyph(*top), glyph(*bottom))
+                }
+                [.., (_, _, middle)] => format!("{over}{}", glyph(*middle)),
+                [] => String::new(),
             };
-            if con.nodes[index..(index + 2).min(con.nodes.len())]
-                .iter()
-                .any(|c| c.focused)
-            {
+            if children.iter().any(|c| c.focused) {
                 column = format!("<span background='{FOCUS_HIGHLIGHT}'>{column}</span>");
             }
             columns.push_str(&column);
@@ -984,18 +1045,22 @@ impl Daemon {
 
     /// Size in pt of the compositor's title font, from its config.
     fn title_font_size(&mut self) -> f64 {
+        static FONT_LINE: LazyLock<Option<Regex>> =
+            LazyLock::new(|| Regex::new(r"(?m)^font\s+(.*?)\s*$").ok());
+        static FONT_SIZE: LazyLock<Option<Regex>> =
+            LazyLock::new(|| Regex::new(r"([\d.]+)\s*(px)?$").ok());
         if let Some(size) = self.compositor_font_size {
             return size;
         }
-        static FONT_LINE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?m)^font\s+(.*?)\s*$").unwrap());
-        static FONT_SIZE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"([\d.]+)\s*(px)?$").unwrap());
         let mut size = DEFAULT_TITLE_FONT_SIZE;
         let config = self.ipc.get_config().unwrap_or_default();
-        if let Some(line) = FONT_LINE.captures(&config)
-            && let Some(found) = FONT_SIZE.captures(&line[1])
-            && let Ok(points) = found[1].parse::<f64>()
+        if let Some(font_line) = FONT_LINE.as_ref()
+            && let Some(font_size) = FONT_SIZE.as_ref()
+            && let Some(line) = font_line.captures(&config)
+            && let Some(font) = line.get(1)
+            && let Some(found) = font_size.captures(font.as_str())
+            && let Some(points) = found.get(1)
+            && let Ok(points) = points.as_str().parse::<f64>()
         {
             size = if found.get(2).is_some() {
                 points * 0.75
@@ -1039,13 +1104,18 @@ impl Daemon {
     /// Replace Sway's `H[app app]` split container titles with icons.
     fn update_split_container_titles(&mut self, family: &str) -> Result<()> {
         let mut formats: HashMap<i64, String> = HashMap::new();
-        for con in self.split_containers()? {
+        for con in self
+            .split_containers()
+            .context("getting split containers")?
+        {
             let title_format = self.container_representation(&con, family, false, false);
             if self.split_container_formats.get(&con.id) != Some(&title_format) {
-                self.ipc.command(&format!(
-                    "[con_id={}] title_format \"{title_format}\"",
-                    con.id
-                ))?;
+                self.ipc
+                    .command(&format!(
+                        "[con_id={}] title_format \"{title_format}\"",
+                        con.id
+                    ))
+                    .with_context(|| format!("setting title format of container {}", con.id))?;
             }
             formats.insert(con.id, title_format);
         }
@@ -1053,16 +1123,18 @@ impl Daemon {
         Ok(())
     }
 
-    fn process_icons(&self, icons: Vec<String>) -> Vec<String> {
-        let mut unique: Vec<String> = Vec::new();
+    /// Merge repeated icons. Working jobs' animated icons are kept apart
+    /// from the same icons at rest, which they match once per turn.
+    fn process_icons(&self, icons: Vec<(String, bool)>) -> Vec<String> {
+        let mut unique: Vec<(String, bool)> = Vec::new();
         for icon in &icons {
             if !unique.contains(icon) {
                 unique.push(icon.clone());
             }
         }
         let digits = match self.settings.unique_icons_mode {
-            UniqueIconsMode::Nonunique => return icons,
-            UniqueIconsMode::Unique => return unique,
+            UniqueIconsMode::Nonunique => return icons.into_iter().map(|(icon, _)| icon).collect(),
+            UniqueIconsMode::Unique => return unique.into_iter().map(|(icon, _)| icon).collect(),
             UniqueIconsMode::NumbersSuperscript => &SUPERSCRIPT_DIGITS,
             UniqueIconsMode::NumbersSubscript => &SUBSCRIPT_DIGITS,
         };
@@ -1070,11 +1142,12 @@ impl Daemon {
             .into_iter()
             .map(|icon| {
                 let count = icons.iter().filter(|i| **i == icon).count();
+                let (icon, _) = icon;
                 if count > 1 {
                     let suffix: String = count
                         .to_string()
                         .chars()
-                        .map(|d| digits[d.to_digit(10).unwrap() as usize])
+                        .filter_map(|d| digits.get(d.to_digit(10)? as usize))
                         .collect();
                     format!("{icon}{suffix}")
                 } else {
@@ -1122,15 +1195,19 @@ impl Daemon {
             if let Err(error) = self.process_new_programs() {
                 log::warn!("Could not add new programs: {error:#}");
             }
-            self.update_workspace_names()?;
-            self.update_window_titles()?;
+            self.update_workspace_names()
+                .context("updating workspace names")?;
+            self.update_window_titles()
+                .context("updating window titles")?;
         }
         Ok(())
     }
 
     /// Restore workspace names and title formats.
     pub fn reset_desktop_state(&mut self) -> Result<()> {
-        self.reset_plan().apply(self.ipc.as_mut())?;
+        self.reset_plan()
+            .apply(self.ipc.as_mut())
+            .context("restoring workspace names and titles")?;
         self.titlebar_icon_codepoints.clear();
         self.split_container_formats.clear();
         Ok(())
@@ -1145,15 +1222,24 @@ impl Daemon {
             .settings
             .font_output_path
             .file_name()
-            .context("Font output has no file name")?;
+            .context("font output path has no file name")?;
         let destination = self.font_installer.fonts_dir.join(name);
-        let session_font = self.session_font(&destination)?;
+        let session_font = self
+            .session_font(&destination)
+            .context("finding this session's font")?;
         let active_font_available = self.snapshot_active_font(&session_font);
         let map_was_repaired = self.program_icon_map.modified_at_load;
-        let installed_added = self.discover_installed_programs()?;
-        let running_added = self.add_running_programs()?;
-        let mut favicons_changed = self.add_top_favicons()?;
-        favicons_changed = self.add_preset_jobs()? || favicons_changed;
+        let installed_added = self
+            .discover_installed_programs()
+            .context("discovering installed programs")?;
+        let running_added = self
+            .add_running_programs()
+            .context("adding running programs")?;
+        let mut favicons_changed = self
+            .add_top_favicons()
+            .context("adding top site favicons")?;
+        favicons_changed =
+            self.add_preset_jobs().context("adding preset jobs")? || favicons_changed;
 
         let expected: HashSet<u32> = self
             .program_icon_map
@@ -1166,7 +1252,8 @@ impl Daemon {
 
         if !active_font_available {
             log::info!("No usable preinstalled icon font; creating one for next login");
-            self.publish_font_update(false)?;
+            self.publish_font_update(false)
+                .context("publishing initial font")?;
             (self.notifier)(
                 "WorkspaceIconDaemon: Icon font installed",
                 "Log out and back in again to show application icons",
@@ -1174,13 +1261,15 @@ impl Daemon {
             return Ok(false);
         }
         if installed_added || running_added || map_was_repaired {
-            self.publish_font_update(true)?;
+            self.publish_font_update(true)
+                .context("publishing font update")?;
         } else if installed_is_outdated
             || favicons_changed
             || font_builder::font_version(&destination).as_deref() != Some(FONT_LAYOUT_VERSION)
         {
             // Only favicons changed; they show up quietly after a later login.
-            self.publish_font_update(false)?;
+            self.publish_font_update(false)
+                .context("publishing font update")?;
         }
         self.program_icon_map.modified_at_load = false;
         Ok(true)
@@ -1192,12 +1281,19 @@ impl Daemon {
     /// file is replaced by rebuilds, so the first daemon start of a session
     /// keeps a copy for later restarts (e.g. on config reloads) to consult.
     fn session_font(&self, installed_font: &Path) -> Result<PathBuf> {
-        static SESSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.(\d+)\.sock$").unwrap());
+        static SESSION: LazyLock<Option<Regex>> =
+            LazyLock::new(|| Regex::new(r"\.(\d+)\.sock$").ok());
+        let session_pattern = SESSION
+            .as_ref()
+            .context("session socket pattern is invalid")?;
         let socket = ["SWAYSOCK", "I3SOCK"]
             .iter()
             .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
             .unwrap_or_default();
-        let Some(session) = SESSION.captures(&socket) else {
+        let Some(session) = session_pattern
+            .captures(&socket)
+            .and_then(|captures| captures.get(1))
+        else {
             return Ok(installed_font.to_path_buf());
         };
         if !installed_font.is_file() {
@@ -1209,15 +1305,24 @@ impl Daemon {
             .parent()
             .unwrap_or(Path::new("."))
             .join("sessions");
-        let session_font = session_dir.join(format!("{}.ttf", &session[1]));
+        let session_font = session_dir.join(format!("{}.ttf", session.as_str()));
         if !session_font.is_file() {
-            std::fs::create_dir_all(&session_dir)?;
-            for stale in std::fs::read_dir(&session_dir)?.flatten() {
+            std::fs::create_dir_all(&session_dir)
+                .with_context(|| format!("creating {}", session_dir.display()))?;
+            let stale_fonts = std::fs::read_dir(&session_dir)
+                .with_context(|| format!("reading {}", session_dir.display()))?;
+            for stale in stale_fonts.flatten() {
                 if stale.path().extension().is_some_and(|e| e == "ttf") {
                     let _ = std::fs::remove_file(stale.path());
                 }
             }
-            std::fs::copy(installed_font, &session_font)?;
+            std::fs::copy(installed_font, &session_font).with_context(|| {
+                format!(
+                    "copying {} to {}",
+                    installed_font.display(),
+                    session_font.display()
+                )
+            })?;
         }
         Ok(session_font)
     }
@@ -1269,7 +1374,8 @@ fn workspace_base_name(name: &str, icon_chars: &HashSet<char>) -> String {
             || c == ' '
     };
     let base = name.trim_end_matches(is_suffix);
-    if !name[base.len()..].chars().any(|c| icon_chars.contains(&c)) {
+    let suffix = name.get(base.len()..).unwrap_or_default();
+    if !suffix.chars().any(|c| icon_chars.contains(&c)) {
         return name.to_string(); // No icons of ours; leave e.g. trailing spaces alone.
     }
     base.to_string()
@@ -1284,15 +1390,19 @@ pub struct ResetPlan {
 
 impl ResetPlan {
     pub fn apply(&self, ipc: &mut dyn Ipc) -> Result<()> {
-        let tree = ipc.get_tree()?;
+        let tree = ipc.get_tree().context("getting window tree")?;
         if self.titlebar_icons {
             for window in tree.leaves() {
-                ipc.command(&format!("[con_id={}] title_format \"%title\"", window.id))?;
+                ipc.command(&format!("[con_id={}] title_format \"%title\"", window.id))
+                    .with_context(|| format!("resetting title format of window {}", window.id))?;
             }
             for workspace in tree.workspaces() {
                 for con in workspace.descendants() {
                     if con.kind == "con" && !con.nodes.is_empty() {
-                        ipc.command(&format!("[con_id={}] title_format \"%title\"", con.id))?;
+                        ipc.command(&format!("[con_id={}] title_format \"%title\"", con.id))
+                            .with_context(|| {
+                                format!("resetting title format of container {}", con.id)
+                            })?;
                     }
                 }
             }
@@ -1305,7 +1415,10 @@ impl ResetPlan {
                 if new_name != workspace.name() {
                     let old = workspace.name().replace('"', "\\\"");
                     let new = new_name.replace('"', "\\\"");
-                    ipc.command(&format!("rename workspace \"{old}\" to \"{new}\""))?;
+                    ipc.command(&format!("rename workspace \"{old}\" to \"{new}\""))
+                        .with_context(|| {
+                            format!("renaming workspace {:?} to {new_name:?}", workspace.name())
+                        })?;
                 }
             }
         }
@@ -1317,10 +1430,11 @@ impl ResetPlan {
 /// numbered workspace, otherwise "BASE ICONS", or the base name alone when
 /// there are no icons.
 pub fn construct_workspace_name(num: i32, icons: &[String], base_name: Option<&str>) -> String {
-    static NUMBERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+:?$").unwrap());
+    static NUMBERED: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"^\d+:?$").ok());
     let icons = icons.concat();
+    let is_numbered = |base: &str| NUMBERED.as_ref().is_some_and(|r| r.is_match(base.trim()));
     match base_name {
-        Some(base) if !NUMBERED.is_match(base.trim()) => {
+        Some(base) if !is_numbered(base) => {
             if icons.is_empty() {
                 base.to_string()
             } else {
@@ -1343,34 +1457,41 @@ pub fn construct_workspace_name(num: i32, icons: &[String], base_name: Option<&s
 }
 
 pub fn lock(daemon: &Mutex<Daemon>) -> std::sync::MutexGuard<'_, Daemon> {
-    daemon.lock().unwrap_or_else(|e| e.into_inner())
+    daemon.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Run the daemon until the compositor goes away.
 pub fn run(
-    daemon: Arc<Mutex<Daemon>>,
+    daemon: &Arc<Mutex<Daemon>>,
     connect_events: impl FnOnce() -> Result<crate::ipc::EventStream>,
 ) -> Result<()> {
     use crate::ipc::Event;
     log::info!("Starting workspace icon daemon...");
     let (requests, received) = mpsc::channel::<()>();
-    lock(&daemon).rebuild_requests = Some(requests);
+    lock(daemon).rebuild_requests = Some(requests);
     {
-        let mut guard = lock(&daemon);
-        if !guard.ensure_startup_font()? {
+        let mut guard = lock(daemon);
+        if !guard
+            .ensure_startup_font()
+            .context("preparing the icon font")?
+        {
             return Ok(());
         }
-        guard.update_workspace_names()?;
-        guard.update_window_titles()?;
+        guard
+            .update_workspace_names()
+            .context("updating workspace names")?;
+        guard
+            .update_window_titles()
+            .context("updating window titles")?;
     }
-    let mut events = connect_events()?;
-    let rebuilder = Arc::clone(&daemon);
+    let mut events = connect_events().context("connecting to compositor events")?;
+    let rebuilder = Arc::clone(daemon);
     std::thread::spawn(move || {
         while received.recv().is_ok() {
             // Wait until requests stop arriving, then build once.
             loop {
                 match received.recv_timeout(FAVICON_REBUILD_DELAY) {
-                    Ok(()) => continue,
+                    Ok(()) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -1381,7 +1502,7 @@ pub fn run(
             }
         }
     });
-    let animator = Arc::clone(&daemon);
+    let animator = Arc::clone(daemon);
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(ANIMATION_FRAME);
@@ -1390,8 +1511,8 @@ pub fn run(
     });
 
     log::info!("Daemon is running. Press Ctrl+C to exit.");
-    while let Some(event) = events.next_event()? {
-        let mut guard = lock(&daemon);
+    while let Some(event) = events.next_event().context("reading compositor event")? {
+        let mut guard = lock(daemon);
         let result = match &event {
             Event::Window { change, container } => match change.as_str() {
                 "focus" => guard.update_window_titles(),

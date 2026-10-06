@@ -27,9 +27,8 @@ fn parse_codepoint(value: &str) -> Result<u32, String> {
 )]
 struct Args {
     /// Directory containing icon files (PNGs/SVGs), sorted by file name.
-    /// Default: ./input_symbols
-    #[arg(long, conflicts_with = "icon_paths")]
-    input_folder: Option<PathBuf>,
+    #[arg(long, conflicts_with = "icon_paths", default_value = "input_symbols")]
+    input_folder: PathBuf,
 
     /// Icon files, mapped to code points in the order given
     #[arg(long, num_args = 1.., value_name = "PATH")]
@@ -64,14 +63,10 @@ fn main() -> Result<()> {
         .format_timestamp(None)
         .init();
 
-    let image_paths = if !args.icon_paths.is_empty() {
-        args.icon_paths
-    } else {
-        let folder = args
-            .input_folder
-            .unwrap_or_else(|| PathBuf::from("input_symbols"));
+    let image_paths = if args.icon_paths.is_empty() {
+        let folder = args.input_folder;
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&folder)
-            .with_context(|| format!("Reading {}", folder.display()))?
+            .with_context(|| format!("reading {}", folder.display()))?
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
@@ -81,11 +76,13 @@ fn main() -> Result<()> {
                     })
             })
             .collect();
-        paths.sort_by_key(|path| path.file_name().map(|n| n.to_os_string()));
+        paths.sort_by_key(|path| path.file_name().map(std::ffi::OsStr::to_os_string));
         paths
+    } else {
+        args.icon_paths
     };
     let base_font = match &args.base_font {
-        Some(path) => std::fs::read(path).with_context(|| format!("Reading {}", path.display()))?,
+        Some(path) => std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
         None => assets::BASE_FONT.to_vec(),
     };
     let builder = FontBuilder {
@@ -94,11 +91,15 @@ fn main() -> Result<()> {
         remove_original_symbols: args.remove_original_symbols,
         ..Default::default()
     };
-    let built = builder.build(&base_font, &image_paths)?;
+    let built = builder
+        .build(&base_font, &image_paths)
+        .context("building font")?;
     if let Some(parent) = args.output.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&args.output, &built.data)?;
+    std::fs::write(&args.output, &built.data)
+        .with_context(|| format!("writing {}", args.output.display()))?;
     for (path, codepoint) in image_paths.iter().zip(&built.codepoints) {
         log::info!("[+] {} -> U+{codepoint:04X}", path.display());
     }

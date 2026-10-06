@@ -35,7 +35,7 @@ pub struct WindowProperties {
     pub class: Option<String>,
 }
 
-/// A node of the layout tree, as returned by GET_TREE.
+/// A node of the layout tree, as returned by `GET_TREE`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Node {
@@ -174,23 +174,26 @@ fn socket_path() -> Result<String> {
             }
         }
     }
-    bail!("Could not find the i3/Sway IPC socket")
+    bail!("no i3/Sway IPC socket found")
 }
 
 impl Connection {
     pub fn connect() -> Result<Self> {
-        let path = socket_path()?;
-        let stream = UnixStream::connect(&path).with_context(|| format!("Connecting to {path}"))?;
+        let path = socket_path().context("locating the i3/Sway IPC socket")?;
+        let stream = UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
         Ok(Self { stream })
     }
 
     fn send(&mut self, kind: u32, payload: &[u8]) -> Result<()> {
         let mut message = Vec::with_capacity(14 + payload.len());
         message.extend_from_slice(MAGIC);
-        message.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        let length = u32::try_from(payload.len()).context("IPC payload too large")?;
+        message.extend_from_slice(&length.to_ne_bytes());
         message.extend_from_slice(&kind.to_ne_bytes());
         message.extend_from_slice(payload);
-        self.stream.write_all(&message)?;
+        self.stream
+            .write_all(&message)
+            .context("writing to the IPC socket")?;
         Ok(())
     }
 
@@ -200,15 +203,19 @@ impl Connection {
         match self.stream.read_exact(&mut header) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error).context("reading IPC message header"),
         }
-        if &header[..6] != MAGIC {
-            bail!("Invalid IPC message");
+        let [magic @ .., l0, l1, l2, l3, k0, k1, k2, k3] = header;
+        if magic != *MAGIC {
+            bail!("invalid IPC message");
         }
-        let length = u32::from_ne_bytes(header[6..10].try_into().unwrap()) as usize;
-        let kind = u32::from_ne_bytes(header[10..14].try_into().unwrap());
+        let length = usize::try_from(u32::from_ne_bytes([l0, l1, l2, l3]))
+            .context("IPC message too large")?;
+        let kind = u32::from_ne_bytes([k0, k1, k2, k3]);
         let mut payload = vec![0u8; length];
-        self.stream.read_exact(&mut payload)?;
+        self.stream
+            .read_exact(&mut payload)
+            .context("reading IPC message payload")?;
         // Titles may hold invalid UTF-8; replace it rather than reject the
         // whole message.
         let payload = match String::from_utf8_lossy(&payload) {
@@ -219,21 +226,24 @@ impl Connection {
     }
 
     fn request(&mut self, kind: u32, payload: &[u8]) -> Result<Vec<u8>> {
-        self.send(kind, payload)?;
+        self.send(kind, payload).context("sending IPC request")?;
         loop {
-            match self.receive()? {
+            match self.receive().context("receiving IPC reply")? {
                 Some((reply, data)) if reply == kind => return Ok(data),
-                Some(_) => continue,
+                Some(_) => {}
                 None => bail!("IPC connection closed"),
             }
         }
     }
 
     pub fn command(&mut self, command: &str) -> Result<()> {
-        let reply = self.request(RUN_COMMAND, command.as_bytes())?;
-        let outcomes: Vec<serde_json::Value> = serde_json::from_slice(&reply)?;
+        let reply = self
+            .request(RUN_COMMAND, command.as_bytes())
+            .with_context(|| format!("running command {command:?}"))?;
+        let outcomes: Vec<serde_json::Value> =
+            serde_json::from_slice(&reply).context("parsing command reply")?;
         for outcome in outcomes {
-            if outcome.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            if outcome.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
                 log::debug!(
                     "Command failed: {command}: {}",
                     outcome.get("error").and_then(|v| v.as_str()).unwrap_or("")
@@ -244,11 +254,17 @@ impl Connection {
     }
 
     pub fn get_tree(&mut self) -> Result<Node> {
-        Ok(serde_json::from_slice(&self.request(GET_TREE, b"")?)?)
+        let reply = self
+            .request(GET_TREE, b"")
+            .context("requesting the layout tree")?;
+        serde_json::from_slice(&reply).context("parsing the layout tree")
     }
 
     pub fn get_version(&mut self) -> Result<Version> {
-        Ok(serde_json::from_slice(&self.request(GET_VERSION, b"")?)?)
+        let reply = self
+            .request(GET_VERSION, b"")
+            .context("requesting the version")?;
+        serde_json::from_slice(&reply).context("parsing the version")
     }
 
     pub fn get_config(&mut self) -> Result<String> {
@@ -256,15 +272,22 @@ impl Connection {
         struct Config {
             config: String,
         }
-        let config: Config = serde_json::from_slice(&self.request(GET_CONFIG, b"")?)?;
+        let reply = self
+            .request(GET_CONFIG, b"")
+            .context("requesting the config")?;
+        let config: Config = serde_json::from_slice(&reply).context("parsing the config")?;
         Ok(config.config)
     }
 
     pub fn subscribe(mut self, events: &[&str]) -> Result<EventStream> {
-        let reply = self.request(SUBSCRIBE, serde_json::to_string(events)?.as_bytes())?;
-        let reply: serde_json::Value = serde_json::from_slice(&reply)?;
-        if reply.get("success").and_then(|v| v.as_bool()) != Some(true) {
-            bail!("Could not subscribe to IPC events");
+        let events = serde_json::to_string(events).context("serializing event names")?;
+        let reply = self
+            .request(SUBSCRIBE, events.as_bytes())
+            .with_context(|| format!("subscribing to {events}"))?;
+        let reply: serde_json::Value =
+            serde_json::from_slice(&reply).context("parsing subscribe reply")?;
+        if reply.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+            bail!("IPC event subscription refused");
         }
         Ok(EventStream { connection: self })
     }
@@ -287,7 +310,8 @@ impl EventStream {
             change: String,
         }
         loop {
-            let Some((kind, payload)) = self.connection.receive()? else {
+            let Some((kind, payload)) = self.connection.receive().context("receiving IPC event")?
+            else {
                 return Ok(None);
             };
             let event = match kind {
@@ -327,7 +351,7 @@ mod tests {
         let mut connection = Connection { stream: a };
         let payload = b"{\"name\":\"bad \xff title\"}";
         let mut message = MAGIC.to_vec();
-        message.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        message.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_ne_bytes());
         message.extend_from_slice(&GET_TREE.to_ne_bytes());
         message.extend_from_slice(payload);
         b.write_all(&message).unwrap();

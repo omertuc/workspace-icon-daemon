@@ -38,7 +38,7 @@ impl Ipc for FakeIpc {
     }
 }
 
-fn workspace(num: i32, name: &str, nodes: serde_json::Value) -> serde_json::Value {
+fn workspace(num: i32, name: &str, nodes: &serde_json::Value) -> serde_json::Value {
     json!({"id": 1, "type": "root", "nodes": [{"id": 2, "type": "output", "nodes": [
         {"id": 3, "type": "workspace", "num": num, "name": name, "nodes": nodes}
     ]}]})
@@ -183,14 +183,14 @@ fn font_rebuild_preserves_codepoints_after_icon_removal() {
 fn stacked_codepoints_cover_programs_and_favicons() {
     assert_eq!(
         stacked_codepoints(0xEC00),
-        Some((0x108000, 0x10B000, 0x10E000))
+        Some((0x0010_8000, 0x0010_B000, 0x0010_E000))
     );
     assert_eq!(
-        stacked_codepoints(0x100002),
-        Some((0x108402, 0x10B402, 0x10E402))
+        stacked_codepoints(0x0010_0002),
+        Some((0x0010_8402, 0x0010_B402, 0x0010_E402))
     );
     assert_eq!(stacked_codepoints(0xE000), None);
-    assert_eq!(stacked_codepoints(0x100000 + STACK_SLOTS), None);
+    assert_eq!(stacked_codepoints(0x0010_0000 + STACK_SLOTS), None);
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn collects_native_and_xwayland_windows_in_layout_order() {
     fixture.ipc.set_tree(workspace(
         2,
         "2",
-        json!([window(5, "foot", 500, 0), xwayland]),
+        &json!([window(5, "foot", 500, 0), xwayland]),
     ));
     let tree = fixture.daemon.ipc.get_tree().unwrap();
     let workspaces = fixture.daemon.programs_by_workspace(&tree);
@@ -212,22 +212,30 @@ fn collects_native_and_xwayland_windows_in_layout_order() {
 #[test]
 fn icon_count_modes_and_workspace_names() {
     let mut fixture = Fixture::new();
-    let icons = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let processed = fixture.daemon.process_icons(icons(&["a", "b", "a"]));
+    let icons = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let at_rest = |v: &[&str]| v.iter().map(|i| (i.to_string(), false)).collect::<Vec<_>>();
+    let processed = fixture.daemon.process_icons(at_rest(&["a", "b", "a"]));
     assert_eq!(processed, ["a₂", "b"]);
+    // A working job's frame that matches its icon at rest stays separate.
+    let working = vec![
+        ("a".to_string(), true),
+        ("a".to_string(), false),
+        ("a".to_string(), true),
+    ];
+    assert_eq!(fixture.daemon.process_icons(working), ["a₂", "a"]);
     fixture.daemon.settings.unique_icons_mode = UniqueIconsMode::NumbersSuperscript;
     assert_eq!(
-        fixture.daemon.process_icons(icons(&["a", "a", "a"])),
+        fixture.daemon.process_icons(at_rest(&["a", "a", "a"])),
         ["a³"]
     );
     fixture.daemon.settings.unique_icons_mode = UniqueIconsMode::Unique;
     assert_eq!(
-        fixture.daemon.process_icons(icons(&["a", "b", "a"])),
+        fixture.daemon.process_icons(at_rest(&["a", "b", "a"])),
         ["a", "b"]
     );
     fixture.daemon.settings.unique_icons_mode = UniqueIconsMode::Nonunique;
     assert_eq!(
-        fixture.daemon.process_icons(icons(&["a", "b", "a"])),
+        fixture.daemon.process_icons(at_rest(&["a", "b", "a"])),
         ["a", "b", "a"]
     );
 
@@ -264,7 +272,7 @@ fn workspaces_are_renamed_with_loaded_icons() {
     fixture.ipc.set_tree(workspace(
         1,
         "1",
-        json!([
+        &json!([
             window(5, "app", 0, 0),
             window(6, "app", 100, 0),
             window(7, "unknown", 200, 0)
@@ -291,7 +299,7 @@ fn titlebar_icons_use_scoped_font_and_mapped_codepoint() {
     fixture.ipc.set_tree(workspace(
         1,
         "1",
-        json!([window(41, "app", 0, 0), window(43, "unmapped", 0, 0)]),
+        &json!([window(41, "app", 0, 0), window(43, "unmapped", 0, 0)]),
     ));
     fixture.daemon.update_window_titles().unwrap();
     assert!(fixture.ipc.commands().is_empty(), "titlebar icons are off");
@@ -328,7 +336,7 @@ fn split_containers_show_their_layout() {
             window(13, "app", 0, 0), {"id": 14, "type": "con", "app_id": "app", "focused": true, "nodes": []}
         ]}
     ]});
-    fixture.ipc.set_tree(workspace(1, "1", json!([split])));
+    fixture.ipc.set_tree(workspace(1, "1", &json!([split])));
     fixture.daemon.update_window_titles().unwrap();
     let commands = fixture.ipc.commands();
     let split_title = commands
@@ -405,14 +413,14 @@ fn new_program_is_installed_but_uses_loaded_placeholder() {
     // Startup discovers the installed app first, so start without it.
     let empty = fixture.root.join("empty");
     desktop::tests::with_xdg(&empty, &[&empty], || {
-        assert!(fixture.daemon.ensure_startup_font().unwrap())
+        assert!(fixture.daemon.ensure_startup_font().unwrap());
     });
 
     fixture
         .ipc
-        .set_tree(workspace(1, "1", json!([window(42, "new-app", 0, 0)])));
+        .set_tree(workspace(1, "1", &json!([window(42, "new-app", 0, 0)])));
     desktop::tests::with_xdg(&data, &[&data], || {
-        fixture.daemon.on_window_event("new", None).unwrap()
+        fixture.daemon.on_window_event("new", None).unwrap();
     });
     assert_eq!(
         fixture.daemon.active_unicode_id("new-app"),
@@ -480,7 +488,7 @@ fn reset_restores_names_and_titles() {
     let name = format!("1: {}", char::from_u32(0xEC01).unwrap());
     fixture
         .ipc
-        .set_tree(workspace(1, &name, json!([window(5, "app", 0, 0)])));
+        .set_tree(workspace(1, &name, &json!([window(5, "app", 0, 0)])));
     fixture.daemon.reset_desktop_state().unwrap();
     assert_eq!(
         fixture.ipc.commands(),
@@ -493,7 +501,7 @@ fn reset_restores_names_and_titles() {
 
 #[test]
 fn formats_numbers_like_python() {
-    assert_eq!(format_g(14.000000000000002), "14");
+    assert_eq!(format_g(14.000_000_000_000_002), "14");
     assert_eq!(format_g(10.0 * 1.4), "14");
     assert_eq!(format_g(13.0), "13");
     assert_eq!(format_g(19.6), "19.6");

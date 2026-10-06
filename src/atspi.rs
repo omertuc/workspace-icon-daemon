@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use regex::Regex;
+use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use zbus::blocking::Connection;
 use zbus::zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Type};
@@ -19,19 +19,26 @@ const TEXT: &str = "org.a11y.atspi.Text";
 /// An accessible object: its bus name and object path.
 type Accessible = (String, OwnedObjectPath);
 
-fn connect() -> zbus::Result<Connection> {
-    let session = Connection::session()?;
-    let reply = session.call_method(
-        Some("org.a11y.Bus"),
-        "/org/a11y/bus",
-        Some("org.a11y.Bus"),
-        "GetAddress",
-        &(),
-    )?;
-    let address: String = reply.body().deserialize()?;
-    zbus::blocking::connection::Builder::address(address.as_str())?
+fn connect() -> Result<Connection> {
+    let session = Connection::session().context("connecting to the session bus")?;
+    let reply = session
+        .call_method(
+            Some("org.a11y.Bus"),
+            "/org/a11y/bus",
+            Some("org.a11y.Bus"),
+            "GetAddress",
+            &(),
+        )
+        .context("asking for the accessibility bus address")?;
+    let address: String = reply
+        .body()
+        .deserialize()
+        .context("reading the accessibility bus address")?;
+    zbus::blocking::connection::Builder::address(address.as_str())
+        .with_context(|| format!("parsing accessibility bus address {address:?}"))?
         .method_timeout(Duration::from_secs(2))
         .build()
+        .with_context(|| format!("connecting to the accessibility bus at {address}"))
 }
 
 fn call<B, R>(bus: &Connection, node: &Accessible, iface: &str, method: &str, body: &B) -> Option<R>
@@ -102,29 +109,38 @@ pub fn host(address: Option<&str>) -> Option<String> {
 /// Map each browser window's (browser family, page title) to the host in
 /// its address bar.
 pub fn address_bar_hosts() -> HashMap<(String, String), Option<String>> {
-    let mut hosts: HashMap<(String, String), Option<String>> = HashMap::new();
-    let bus = match connect() {
-        Ok(bus) => bus,
+    match read_address_bar_hosts() {
+        Ok(hosts) => hosts,
         Err(error) => {
-            log::debug!("AT-SPI unavailable: {error}");
-            return hosts;
+            log::debug!("AT-SPI unavailable: {error:#}");
+            HashMap::new()
         }
-    };
-    let browser = Regex::new(r"(?i)firefox|chrom").unwrap();
+    }
+}
+
+fn is_browser_app(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name.contains("firefox") || name.contains("chrom")
+}
+
+fn read_address_bar_hosts() -> Result<HashMap<(String, String), Option<String>>> {
+    let mut hosts: HashMap<(String, String), Option<String>> = HashMap::new();
+    let bus = connect().context("connecting to AT-SPI")?;
     let root: Accessible = (
         "org.a11y.atspi.Registry".to_string(),
-        OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root").unwrap(),
+        OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root")
+            .context("parsing the registry root path")?,
     );
     let mut conflicting: HashSet<(String, String)> = HashSet::new();
     for app in children(&bus, &root) {
-        let Some(app_name) = name(&bus, &app).filter(|n| browser.is_match(n)) else {
+        let Some(app_name) = name(&bus, &app).filter(|n| is_browser_app(n)) else {
             continue;
         };
         for window in children(&bus, &app) {
             let Some(window_name) = name(&bus, &window).filter(|n| !n.is_empty()) else {
                 continue;
             };
-            let title = page_title(&window_name);
+            let title = page_title(&window_name).context("reading the page title")?;
             if title == window_name {
                 continue; // No page title yet, e.g. a new or loading window.
             }
@@ -139,7 +155,7 @@ pub fn address_bar_hosts() -> HashMap<(String, String), Option<String>> {
             hosts.insert(key, site);
         }
     }
-    hosts
+    Ok(hosts)
 }
 
 #[cfg(test)]

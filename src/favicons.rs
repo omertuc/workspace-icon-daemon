@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use image::imageops::{self, FilterType};
 use regex::Regex;
@@ -28,9 +29,8 @@ const BROWSER_APP_IDS: [&str; 7] = [
 ];
 /// Browser suffixes on window titles, which AT-SPI and Sway don't always
 /// agree on (e.g. "- Google Chrome" vs "- Google Chrome Canary").
-static BROWSER_TITLE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r" [—-] (Mozilla Firefox|Google Chrome|Chromium)( [\w ]+)?$").unwrap()
-});
+static BROWSER_TITLE_SUFFIX: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r" [—-] (Mozilla Firefox|Google Chrome|Chromium)( [\w ]+)?$"));
 /// Icons at least this wide are downscaled into the font's 109px strike;
 /// smaller ones are upscaled, so the largest available is preferred below it.
 const PREFERRED_ICON_WIDTH: u32 = 109;
@@ -62,8 +62,12 @@ pub fn is_browser(program: Option<&str>) -> bool {
     program.is_some_and(|p| BROWSER_APP_IDS.contains(&p.to_lowercase().as_str()))
 }
 
-pub fn page_title(window_title: &str) -> String {
-    BROWSER_TITLE_SUFFIX.replace(window_title, "").into_owned()
+pub fn page_title(window_title: &str) -> Result<String> {
+    let suffix = BROWSER_TITLE_SUFFIX
+        .as_ref()
+        .map_err(Clone::clone)
+        .context("compiling the browser title suffix pattern")?;
+    Ok(suffix.replace(window_title, "").into_owned())
 }
 
 /// Browser family of an app id or AT-SPI application name.
@@ -75,6 +79,11 @@ pub fn browser_family(name: &str) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "only used for small positive fractions of the icon canvas"
+)]
 fn round(value: f64) -> u32 {
     value.round_ties_even() as u32
 }
@@ -105,10 +114,12 @@ fn firefox_profile_dirs() -> Vec<PathBuf> {
         xdg::home().join(".mozilla/firefox"),
     ] {
         for section in ini_values(&root.join("installs.ini"), "default") {
-            dirs.push(root.join(&section["default"]));
+            dirs.extend(section.get("default").map(|default| root.join(default)));
         }
         for section in ini_values(&root.join("profiles.ini"), "path") {
-            let path = &section["path"];
+            let Some(path) = section.get("path") else {
+                continue;
+            };
             let relative = section.get("isrelative").is_none_or(|v| v == "1");
             dirs.push(if relative {
                 root.join(path)
@@ -131,7 +142,7 @@ fn firefox_profile_dirs() -> Vec<PathBuf> {
 fn icon_rank(width: i64) -> (u8, i64) {
     if width == SVG_ICON_WIDTH {
         (0, 0)
-    } else if width >= PREFERRED_ICON_WIDTH as i64 {
+    } else if width >= i64::from(PREFERRED_ICON_WIDTH) {
         (1, width)
     } else {
         (2, -width)
@@ -222,10 +233,10 @@ impl FirefoxFavicons {
     /// The host a browser window with this title is showing.
     pub fn host_for_window(&mut self, program: &str, window_title: Option<&str>) -> Option<String> {
         let window_title = window_title.filter(|t| !t.is_empty())?;
-        let key = (
-            browser_family(program).to_string(),
-            page_title(window_title),
-        );
+        let title = page_title(window_title)
+            .inspect_err(|error| log::warn!("{error:#}"))
+            .ok()?;
+        let key = (browser_family(program).to_string(), title);
         // Misses are retried: right after login the browser may not have
         // restored its windows onto the accessibility bus yet.
         let stale = self.looked_up_at.is_none_or(|t| t.elapsed() > MISS_RETRY);
@@ -334,7 +345,7 @@ impl FirefoxFavicons {
             None => host.to_string(),
         };
         if rotation != 0 {
-            name += &format!("@{rotation}");
+            name = format!("{name}@{rotation}");
         }
         let cached = self.icon_dir.join(format!("{name}.v{RENDER_VERSION}.png"));
         if cached.is_file() {
@@ -414,8 +425,8 @@ fn rasterize(data: &[u8], width: i64) -> Option<RgbaImage> {
     imageops::replace(
         &mut square,
         &image,
-        ((side - image.width()) / 2) as i64,
-        ((side - image.height()) / 2) as i64,
+        i64::from((side - image.width()) / 2),
+        i64::from((side - image.height()) / 2),
     );
     // Upscale tiny favicons crisply rather than blurring them.
     let filter = if side < PREFERRED_ICON_WIDTH {
@@ -453,7 +464,7 @@ fn svg_has_emoji_text(data: &[u8]) -> bool {
 /// Overlay a small icon in the bottom-right corner, cutting a transparent
 /// gap around it.
 fn add_badge(mut image: RgbaImage, badge_path: &Path) -> Option<RgbaImage> {
-    let size = round(ICON_CANVAS_PX as f64 * BADGE_FRACTION);
+    let size = round(f64::from(ICON_CANVAS_PX) * BADGE_FRACTION);
     let badge = if raster::is_svg(badge_path) {
         raster::render_svg_file(badge_path, size, size).ok()?
     } else {
@@ -461,31 +472,31 @@ fn add_badge(mut image: RgbaImage, badge_path: &Path) -> Option<RgbaImage> {
         imageops::resize(&decoded, size, size, FilterType::Lanczos3)
     };
     let origin = ICON_CANVAS_PX - size;
-    let gap = round(ICON_CANVAS_PX as f64 * BADGE_GAP_FRACTION) as usize;
+    let gap = round(f64::from(ICON_CANVAS_PX) * BADGE_GAP_FRACTION) as usize;
     // Grow the badge's own silhouette by the gap and erase the image under it.
     let canvas = ICON_CANVAS_PX as usize;
     let mut silhouette = vec![0u8; canvas * canvas];
     for (x, y, pixel) in badge.enumerate_pixels() {
-        silhouette[(origin + y) as usize * canvas + (origin + x) as usize] = pixel[3];
+        *silhouette.get_mut((origin + y) as usize * canvas + (origin + x) as usize)? = pixel[3];
     }
     let silhouette = raster::dilate(&silhouette, canvas, canvas, gap);
-    for (index, pixel) in image.pixels_mut().enumerate() {
-        pixel[3] = pixel[3].saturating_sub(silhouette[index]);
+    for (pixel, cut) in image.pixels_mut().zip(&silhouette) {
+        pixel[3] = pixel[3].saturating_sub(*cut);
     }
-    imageops::overlay(&mut image, &badge, origin as i64, origin as i64);
+    imageops::overlay(&mut image, &badge, i64::from(origin), i64::from(origin));
     Some(image)
 }
 
 /// Top edges of the half-size icons in a stacked column, leaving room above
 /// the pair and between its halves for layout lines.
 fn stack_offsets() -> [(&'static str, u32); 3] {
-    let size = round(ICON_CANVAS_PX as f64 * STACKED_ICON_FRACTION);
+    let size = round(f64::from(ICON_CANVAS_PX) * STACKED_ICON_FRACTION);
     let bottom = ICON_CANVAS_PX - size;
     let top = bottom - STACK_GAP_PX - size;
     [
         ("top", top),
         ("bottom", bottom),
-        ("middle", (top + bottom) / 2),
+        ("middle", top.midpoint(bottom)),
     ]
 }
 
@@ -493,7 +504,7 @@ fn stack_offsets() -> [(&'static str, u32); 3] {
 /// half of its square, so a top and a bottom glyph stack in one column.
 pub fn stacked_variants(icon: &Path, dest_dir: &Path, name: &str) -> Option<[PathBuf; 3]> {
     let column = ICON_CANVAS_PX / 2;
-    let size = round(ICON_CANVAS_PX as f64 * STACKED_ICON_FRACTION);
+    let size = round(f64::from(ICON_CANVAS_PX) * STACKED_ICON_FRACTION);
     let offsets = stack_offsets();
     let paths = offsets.map(|(position, _)| dest_dir.join(format!("{name}-{position}-v2.png")));
     if paths.iter().all(|p| p.is_file()) {
@@ -513,8 +524,8 @@ pub fn stacked_variants(icon: &Path, dest_dir: &Path, name: &str) -> Option<[Pat
         imageops::replace(
             &mut canvas,
             &small,
-            ((column - size) / 2) as i64,
-            top as i64,
+            i64::from((column - size) / 2),
+            i64::from(top),
         );
         raster::save_png(&canvas, path).ok()?;
     }
@@ -523,7 +534,7 @@ pub fn stacked_variants(icon: &Path, dest_dir: &Path, name: &str) -> Option<[Pat
 
 /// A layout line to draw over an icon: along the bottom of a full icon
 /// ("under"), or above ("over") or between ("between") a stacked column.
-pub fn line_icon(dest_dir: &Path, position: &str, line_color: &str) -> anyhow::Result<PathBuf> {
+pub fn line_icon(dest_dir: &Path, position: &str, line_color: &str) -> Result<PathBuf> {
     let path = dest_dir.join(format!(
         "line-{position}-{}.png",
         line_color.trim_start_matches('#')
@@ -544,9 +555,10 @@ pub fn line_icon(dest_dir: &Path, position: &str, line_color: &str) -> anyhow::R
             column - 1 - column / 6,
             gap_middle + LINE_PX / 2 - 1,
         ),
-        _ => anyhow::bail!("Unknown line position {position}"),
+        _ => bail!("unknown line position {position:?}"),
     };
-    std::fs::create_dir_all(dest_dir)?;
+    std::fs::create_dir_all(dest_dir)
+        .with_context(|| format!("creating {}", dest_dir.display()))?;
     let color = raster::parse_color(line_color);
     let mut canvas = RgbaImage::new(ICON_CANVAS_PX, ICON_CANVAS_PX);
     for y in y0..=y1 {
@@ -554,7 +566,7 @@ pub fn line_icon(dest_dir: &Path, position: &str, line_color: &str) -> anyhow::R
             canvas.put_pixel(x, y, color);
         }
     }
-    raster::save_png(&canvas, &path)?;
+    raster::save_png(&canvas, &path).with_context(|| format!("saving {}", path.display()))?;
     Ok(path)
 }
 
@@ -565,11 +577,11 @@ mod tests {
     #[test]
     fn page_titles_drop_browser_suffixes() {
         assert_eq!(
-            page_title("Inbox - Gmail — Mozilla Firefox"),
+            page_title("Inbox - Gmail — Mozilla Firefox").unwrap(),
             "Inbox - Gmail"
         );
-        assert_eq!(page_title("Docs - Google Chrome Canary"), "Docs");
-        assert_eq!(page_title("New Tab"), "New Tab");
+        assert_eq!(page_title("Docs - Google Chrome Canary").unwrap(), "Docs");
+        assert_eq!(page_title("New Tab").unwrap(), "New Tab");
         assert_eq!(browser_family("Google Chrome"), "chrome");
         assert_eq!(browser_family("org.mozilla.firefox"), "firefox");
         assert!(is_browser(Some("Firefox")));
@@ -593,7 +605,7 @@ mod tests {
         assert!(width.max(height) > ICON_CANVAS_PX * 9 / 10);
         let colorful = image
             .pixels()
-            .any(|p| p[3] > 0 && (p[0] as i32 - p[2] as i32).abs() > 60);
+            .any(|p| p[3] > 0 && (i32::from(p[0]) - i32::from(p[2])).abs() > 60);
         assert!(colorful, "emoji should render in colour");
     }
 

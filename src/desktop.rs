@@ -1,6 +1,7 @@
 //! Desktop entries and application icon lookup.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
 use crate::xdg;
@@ -153,10 +154,28 @@ pub fn parse_desktop_value(path: &Path, key: &str) -> Option<String> {
     None
 }
 
+/// The icon file formats used directly, in order of preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconFormat {
+    Svg,
+    Png,
+}
+
+impl IconFormat {
+    pub const ALL: [IconFormat; 2] = [IconFormat::Svg, IconFormat::Png];
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            IconFormat::Svg => "svg",
+            IconFormat::Png => "png",
+        }
+    }
+}
+
 /// Preferred application-icon directories in XDG precedence order.
-pub fn preferred_icon_search_paths(extension: &str) -> Vec<PathBuf> {
-    let relative: &[&str] = match extension {
-        "svg" => &[
+pub fn preferred_icon_search_paths(format: IconFormat) -> Vec<PathBuf> {
+    let relative: &[&str] = match format {
+        IconFormat::Svg => &[
             "icons/hicolor/scalable/apps",
             "icons/Humanity/apps/16",
             "icons/Humanity/apps/22",
@@ -172,7 +191,7 @@ pub fn preferred_icon_search_paths(extension: &str) -> Vec<PathBuf> {
         // The bundled font's bitmap strike is 109px. Prefer the nearest
         // source that does not need upscaling, then larger sources, followed
         // by progressively smaller fallbacks.
-        "png" => &[
+        IconFormat::Png => &[
             "icons/hicolor/128x128/apps",
             "icons/hicolor/192x192/apps",
             "icons/hicolor/256x256/apps",
@@ -188,7 +207,6 @@ pub fn preferred_icon_search_paths(extension: &str) -> Vec<PathBuf> {
             "icons/hicolor/16x16/apps",
             "pixmaps",
         ],
-        _ => panic!("Unsupported icon extension: {extension}"),
     };
     xdg::data_dirs()
         .iter()
@@ -211,8 +229,9 @@ pub fn installed_icon_index() -> HashMap<String, PathBuf> {
     // First the curated application directories for SVG, then PNG. In
     // particular, a colour hicolor PNG must beat an unrelated theme's
     // monochrome SVG.
-    for extension in ["svg", "png"] {
-        for dir in preferred_icon_search_paths(extension) {
+    for format in IconFormat::ALL {
+        let extension = format.extension();
+        for dir in preferred_icon_search_paths(format) {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
@@ -228,9 +247,9 @@ pub fn installed_icon_index() -> HashMap<String, PathBuf> {
         }
     }
     // Only then the recursive fallbacks.
-    for extension in ["svg", "png"] {
+    for format in IconFormat::ALL {
         for root in icon_search_roots() {
-            for path in files_with_extension(&root, extension) {
+            for path in files_with_extension(&root, format.extension()) {
                 icons.entry(stem(&path).to_lowercase()).or_insert(path);
             }
         }
@@ -253,17 +272,14 @@ fn search_name(icon_name: &str) -> String {
 }
 
 /// Resolve a desktop entry's Icon= value with a precomputed index.
-pub fn resolve_icon_from_index(
+pub fn resolve_icon_from_index<S: BuildHasher>(
     icon_name: Option<&str>,
-    index: &HashMap<String, PathBuf>,
+    index: &HashMap<String, PathBuf, S>,
 ) -> Option<PathBuf> {
     let icon_name = icon_name.filter(|name| !name.is_empty())?;
     let path = Path::new(icon_name);
     let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase());
-    if path.is_absolute()
-        && path.is_file()
-        && matches!(extension.as_deref(), Some("svg") | Some("png"))
-    {
+    if path.is_absolute() && path.is_file() && matches!(extension.as_deref(), Some("svg" | "png")) {
         return Some(path.to_path_buf());
     }
     index.get(&search_name(icon_name).to_lowercase()).cloned()
@@ -276,15 +292,17 @@ pub fn resolve_icon_path(icon_name: &str) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
     let name = search_name(icon_name);
-    for extension in ["svg", "png"] {
-        for dir in preferred_icon_search_paths(extension) {
+    for format in IconFormat::ALL {
+        let extension = format.extension();
+        for dir in preferred_icon_search_paths(format) {
             let candidate = dir.join(format!("{name}.{extension}"));
             if candidate.exists() {
                 return Some(candidate);
             }
         }
     }
-    for extension in ["svg", "png"] {
+    for format in IconFormat::ALL {
+        let extension = format.extension();
         let target = format!("{name}.{extension}");
         for root in icon_search_roots() {
             if let Some(found) = files_with_extension(&root, extension)
@@ -337,7 +355,9 @@ pub(crate) mod tests {
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn with_xdg<T>(data_home: &Path, data_dirs: &[&Path], test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let joined: Vec<String> = data_dirs.iter().map(|d| d.display().to_string()).collect();
         let saved = (
             std::env::var_os("XDG_DATA_HOME"),

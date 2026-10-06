@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
+
 /// Linux's process start time, which guards against PID reuse.
 fn process_start_time(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -11,19 +13,21 @@ fn process_start_time(pid: u32) -> Option<String> {
         .get(stat.rfind(')')? + 2..)?
         .split_whitespace()
         .collect();
-    fields.get(19).map(|s| s.to_string())
+    fields.get(19).map(ToString::to_string)
 }
 
 /// Publish this daemon's PID and start time.
-pub fn write(path: &Path) -> std::io::Result<()> {
+pub fn write(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     let pid = std::process::id();
     std::fs::write(
         path,
         format!("{pid} {}\n", process_start_time(pid).unwrap_or_default()),
     )
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Remove the PID file only if it still identifies this process.
@@ -49,8 +53,12 @@ pub fn stop_running_daemon(path: &Path) -> bool {
         let _ = std::fs::remove_file(path);
         return false;
     }
+    let Ok(signed_pid) = i32::try_from(pid) else {
+        let _ = std::fs::remove_file(path);
+        return false;
+    };
     // SAFETY: kill has no memory-safety preconditions.
-    if unsafe { libc_kill(pid as i32, 15) } != 0 {
+    if unsafe { libc_kill(signed_pid, 15) } != 0 {
         let _ = std::fs::remove_file(path);
         return false;
     }

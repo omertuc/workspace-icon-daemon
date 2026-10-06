@@ -14,7 +14,7 @@ pub const PROGRAM_PUA_START: u32 = PUA_START + 1;
 /// Site favicons live in Supplementary Private Use Area-B so that however
 /// many accumulate, they never run into the application icons or other icon
 /// fonts.
-pub const FAVICON_PUA_START: u32 = 0x100000;
+pub const FAVICON_PUA_START: u32 = 0x0010_0000;
 pub const FAVICON_PREFIX: &str = "favicon:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,9 +67,9 @@ impl ProgramIconMap {
             return Ok(map);
         }
         let text = std::fs::read_to_string(filepath)
-            .with_context(|| format!("Reading {}", filepath.display()))?;
+            .with_context(|| format!("reading {}", filepath.display()))?;
         let raw: Option<BTreeMap<String, serde_yaml_ng::Value>> = serde_yaml_ng::from_str(&text)
-            .with_context(|| format!("Parsing {}", filepath.display()))?;
+            .with_context(|| format!("parsing {}", filepath.display()))?;
 
         let mut removed = Vec::new();
         let mut relocated = false;
@@ -107,7 +107,7 @@ impl ProgramIconMap {
         let codepoints: Vec<u32> = map
             .programs
             .values()
-            .filter_map(|e| e.codepoint())
+            .filter_map(ProgramIconEntry::codepoint)
             .collect();
         if let Some(max) = codepoints
             .iter()
@@ -138,22 +138,21 @@ impl ProgramIconMap {
             map.modified_at_load = true;
         }
         if !removed.is_empty() || relocated {
-            map.save()?;
+            map.save()
+                .context("saving the cleaned-up program icon map")?;
         }
         Ok(map)
     }
 
     pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.filepath.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let text = serde_yaml_ng::to_string(&self.programs)?;
-        std::fs::write(&self.filepath, text).with_context(|| {
-            format!(
-                "Failed to save program icon map {}",
-                self.filepath.display()
-            )
-        })?;
+        let text =
+            serde_yaml_ng::to_string(&self.programs).context("serializing the program icon map")?;
+        std::fs::write(&self.filepath, text)
+            .with_context(|| format!("writing {}", self.filepath.display()))?;
         log::debug!("Saved program icon map to {}", self.filepath.display());
         Ok(())
     }
@@ -193,7 +192,7 @@ impl ProgramIconMap {
             program.to_string(),
             ProgramIconEntry {
                 icon_path: Some(icon_path.to_path_buf()),
-                unicode_id: codepoint as i64,
+                unicode_id: i64::from(codepoint),
             },
         );
         log::debug!(

@@ -11,7 +11,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use workspace_icon_daemon::daemon::{
-    self, DEFAULT_FONT_FAMILY_NAME, Daemon, Settings, UniqueIconsMode,
+    self, DEFAULT_FONT_FAMILY_NAME, Daemon, ResetPlan, Settings, UniqueIconsMode,
 };
 use workspace_icon_daemon::icon_map::ProgramIconMap;
 use workspace_icon_daemon::ipc::Connection;
@@ -19,6 +19,10 @@ use workspace_icon_daemon::platform::{self, Compositor, detect_compositor};
 use workspace_icon_daemon::{assets, pidfile, xdg};
 
 #[derive(Parser, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a command-line flag"
+)]
 #[command(
     version,
     about = "workspace icon daemon for i3 and Sway - dynamically create icon fonts and update workspace names"
@@ -123,13 +127,56 @@ fn remove_generated_state(paths: &[&PathBuf]) {
     }
 }
 
+/// Restore the desktop and exit on SIGINT or SIGTERM.
+fn exit_on_signal(
+    daemon: Arc<Mutex<Daemon>>,
+    reset_plan: ResetPlan,
+    pid_path: PathBuf,
+) -> Result<()> {
+    let mut signals = Signals::new([SIGINT, SIGTERM]).context("registering signal handlers")?;
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            log::info!("Received signal {signal}, exiting gracefully...");
+            // Exit promptly even while the daemon is busy (e.g. building a
+            // font): a replacement daemon is waiting for this one to go.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let guard = loop {
+                match daemon.try_lock() {
+                    Ok(guard) => break Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => break None,
+                }
+            };
+            let result = match guard {
+                Some(mut daemon) => daemon.reset_desktop_state(),
+                None => Connection::connect().and_then(|mut c| reset_plan.apply(&mut c)),
+            };
+            if let Err(error) = result {
+                log::warn!("Could not restore workspace names: {error:#}");
+            }
+            pidfile::remove_own(&pid_path);
+            std::process::exit(0);
+        }
+    });
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(args.verbose);
 
-    let mut connection = Connection::connect()?;
+    let mut connection = Connection::connect().context("connecting to the compositor")?;
     let compositor = match args.compositor {
-        Compositor::Auto => detect_compositor(&connection.get_version()?),
+        Compositor::Auto => detect_compositor(
+            &connection
+                .get_version()
+                .context("asking the compositor for its version")?,
+        ),
         requested => requested,
     };
     log::info!("Using {}", compositor.as_str());
@@ -137,7 +184,7 @@ fn main() -> Result<()> {
     let base_font: &'static [u8] = match &args.base_font {
         Some(path) => Box::leak(
             std::fs::read(path)
-                .with_context(|| format!("Reading {}", path.display()))?
+                .with_context(|| format!("reading {}", path.display()))?
                 .into_boxed_slice(),
         ),
         None => assets::BASE_FONT,
@@ -158,7 +205,7 @@ fn main() -> Result<()> {
         title_text_size: args.title_text_size,
         fonts_dir: fonts_dir.clone(),
     };
-    let mut daemon = Daemon::new(Box::new(connection), settings)?;
+    let mut daemon = Daemon::new(Box::new(connection), settings).context("starting the daemon")?;
 
     let cache_dir = args
         .font_output
@@ -169,14 +216,16 @@ fn main() -> Result<()> {
     let installed_font = fonts_dir.join(
         args.font_output
             .file_name()
-            .context("Font output has no file name")?,
+            .context("font output has no file name")?,
     );
 
     if reset {
         pidfile::stop_running_daemon(&pid_path);
         // Also done here: it covers a stale or missing PID file and makes the
         // operation idempotent.
-        daemon.reset_desktop_state()?;
+        daemon
+            .reset_desktop_state()
+            .context("restoring workspace names and titles")?;
         remove_generated_state(&[
             &args.program_icon_map,
             &args.font_output,
@@ -185,10 +234,17 @@ fn main() -> Result<()> {
         ]);
         let _ = platform::refresh_font_cache(&fonts_dir);
         if args.reset_and_rebuild {
-            daemon.program_icon_map = ProgramIconMap::load(&args.program_icon_map)?;
-            daemon.discover_installed_programs()?;
-            daemon.add_running_programs()?;
-            daemon.publish_font_update(false)?;
+            daemon.program_icon_map = ProgramIconMap::load(&args.program_icon_map)
+                .context("loading the program icon map")?;
+            daemon
+                .discover_installed_programs()
+                .context("discovering installed programs")?;
+            daemon
+                .add_running_programs()
+                .context("adding running programs")?;
+            daemon
+                .publish_font_update(false)
+                .context("publishing the rebuilt font")?;
             daemon::notify(
                 "WorkspaceIconDaemon: Icon font rebuilt",
                 "Log out and back in again to show application icons",
@@ -201,45 +257,18 @@ fn main() -> Result<()> {
     // is reloaded, so replace any running daemon rather than have two
     // manage the same workspaces and titles.
     pidfile::stop_running_daemon(&pid_path);
-    pidfile::write(&pid_path)?;
+    pidfile::write(&pid_path).context("writing the PID file")?;
 
     let reset_plan = daemon.reset_plan();
     let daemon = Arc::new(Mutex::new(daemon));
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
-    let on_signal = Arc::clone(&daemon);
-    let signal_pid_path = pid_path.clone();
-    std::thread::spawn(move || {
-        if let Some(signal) = signals.forever().next() {
-            log::info!("Received signal {signal}, exiting gracefully...");
-            // Exit promptly even while the daemon is busy (e.g. building a
-            // font): a replacement daemon is waiting for this one to go.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-            let guard = loop {
-                match on_signal.try_lock() {
-                    Ok(guard) => break Some(guard),
-                    Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
-                    Err(std::sync::TryLockError::WouldBlock)
-                        if std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10))
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) => break None,
-                }
-            };
-            let result = match guard {
-                Some(mut daemon) => daemon.reset_desktop_state(),
-                None => Connection::connect().and_then(|mut c| reset_plan.apply(&mut c)),
-            };
-            if let Err(error) = result {
-                log::warn!("Could not restore workspace names: {error:#}");
-            }
-            pidfile::remove_own(&signal_pid_path);
-            std::process::exit(0);
-        }
-    });
+    exit_on_signal(Arc::clone(&daemon), reset_plan, pid_path.clone())
+        .context("setting up graceful exit")?;
 
-    let result = daemon::run(daemon, || {
-        Connection::connect()?.subscribe(&["window", "workspace", "binding", "shutdown"])
+    let result = daemon::run(&daemon, || {
+        Connection::connect()
+            .context("connecting to the compositor")?
+            .subscribe(&["window", "workspace", "binding", "shutdown"])
+            .context("subscribing to compositor events")
     });
     pidfile::remove_own(&pid_path);
     result

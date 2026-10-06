@@ -14,12 +14,12 @@ pub const PLACEHOLDER_ICON_NAME: &str = "placeholder_icon.svg";
 /// path.
 pub fn placeholder_icon_path() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
+    static WARNED: OnceLock<()> = OnceLock::new();
     let path = PATH.get_or_init(|| {
         xdg::data_home()
             .join(xdg::APP_NAME)
             .join(PLACEHOLDER_ICON_NAME)
     });
-    static WARNED: OnceLock<()> = OnceLock::new();
     let current = std::fs::read(path).ok();
     if current.as_deref() != Some(PLACEHOLDER_ICON) {
         let written = path

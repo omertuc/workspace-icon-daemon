@@ -5,9 +5,7 @@ use std::path::PathBuf;
 pub const APP_NAME: &str = "workspace-icon-daemon";
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
 fn base_dir(variable: &str, default: &str) -> PathBuf {
