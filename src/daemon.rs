@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -16,7 +17,9 @@ use regex::Regex;
 
 use crate::assets::placeholder_icon_path;
 use crate::desktop::{self, corrected_name};
-use crate::favicons::{self, FirefoxFavicons, favicon_program, line_icon, stacked_variants};
+use crate::favicons::{
+    self, Browser, Favicons, favicon_program, line_icon, parse_favicon_program, stacked_variants,
+};
 use crate::font_builder::{self, FontBuilder};
 use crate::icon_map::{
     FAVICON_PREFIX, FAVICON_PUA_START, PLACEHOLDER_CODEPOINT, PUA_START, ProgramIconEntry,
@@ -24,6 +27,7 @@ use crate::icon_map::{
 };
 use crate::ipc::{Ipc, Node};
 use crate::platform::{Compositor, FontInstaller, program_name};
+use crate::terminal;
 use crate::xdg::APP_NAME;
 
 pub const DEFAULT_FONT_FAMILY_NAME: &str = "WorkspaceIconDaemon";
@@ -79,16 +83,21 @@ const STACK_SCALE: f64 = 1.3;
 const FAVICON_TOP_SITES: usize = 300;
 /// Delay before rebuilding the font for newly seen sites, to batch them.
 const FAVICON_REBUILD_DELAY: Duration = Duration::from_mins(2);
-const FAVICON_BADGE_PROGRAMS: [&str; 3] = ["org.mozilla.firefox", "firefox", "firefox-esr"];
 /// Terminals whose foreground job (e.g. nvim) gets its own icon, badged with
 /// the terminal's.
-const TERMINAL_PROGRAMS: [&str; 6] = [
+const TERMINAL_PROGRAMS: [&str; 12] = [
     "Alacritty",
     "foot",
+    "footclient",
     "kitty",
     "org.wezfurlong.wezterm",
     "com.mitchellh.ghostty",
     "org.gnome.Ptyxis",
+    "org.gnome.Terminal",
+    "Gnome-terminal",
+    "org.kde.konsole",
+    "konsole",
+    "xfce4-terminal",
 ];
 const JOB_PREFIX: &str = "job:";
 /// Jobs added to the font up front, so they show from the next login on.
@@ -98,6 +107,13 @@ const PRESET_JOBS: [&str; 5] = ["nvim", "claude", "claude@1", "claude@2", "claud
 fn job_spinner(job: &str) -> &'static [char] {
     match job {
         "claude" => &['◐', '◓', '◑', '◒'],
+        _ => &[],
+    }
+}
+/// Title prefixes that mark a job's window though the title omits its name.
+fn job_title_marks(job: &str) -> &'static [char] {
+    match job {
+        "claude" => &['✳', '◐', '◓', '◑', '◒'],
         _ => &[],
     }
 }
@@ -111,12 +127,20 @@ fn job_favicon_site(job: &str) -> Option<&'static str> {
     }
 }
 
+/// Spun in every titlebar while startup takes noticeably long.
+const STARTUP_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const STARTUP_SPINNER_DELAY: Duration = Duration::from_millis(300);
+const STARTUP_SPINNER_FRAME: Duration = Duration::from_millis(100);
+
 const IGNORED_PROGRAMS: [&str; 10] = [
     "fzf", "tmux", "screen", "vim", "nano", "htop", "btop", "less", "man", "ssh",
 ];
 const SUPERSCRIPT_DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
 const SUBSCRIPT_DIGITS: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
 
+/// Whether the startup spinner may still draw. Checked under the lock before
+/// each frame, so nothing is drawn once the desktop is being restored.
+static STARTUP_SPINNING: Mutex<bool> = Mutex::new(false);
 /// Fonts are written by one build at a time.
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 static CLOCK_START: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -342,7 +366,7 @@ pub struct Daemon {
     stacking_available: bool,
     animating: bool,
     compositor_font_size: Option<f64>,
-    favicons: FirefoxFavicons,
+    favicons: Favicons,
     rebuild_requests: Option<Sender<()>>,
     pub notifier: fn(&str, &str),
     /// The glyphs in the font this session loaded. Installing a replacement
@@ -376,7 +400,7 @@ impl Daemon {
             stacking_available: false,
             animating: false,
             compositor_font_size: None,
-            favicons: FirefoxFavicons::new(&cache_dir),
+            favicons: Favicons::new(&cache_dir),
             rebuild_requests: None,
             notifier: notify,
             active_program_codepoints: HashMap::new(),
@@ -613,40 +637,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Name of the job in the foreground of a terminal window's shell.
-    fn terminal_job(window: &Node) -> Option<String> {
-        let pid = window.pid?;
-        let mut tasks: Vec<u64> = std::fs::read_dir(format!("/proc/{pid}/task"))
-            .ok()?
-            .flatten()
-            .filter_map(|e| e.file_name().to_str()?.parse().ok())
-            .collect();
-        tasks.sort_unstable();
-        let mut children = tasks.iter().flat_map(|task| {
-            std::fs::read_to_string(format!("/proc/{pid}/task/{task}/children"))
-                .unwrap_or_default()
-                .split_whitespace()
-                .filter_map(|c| c.parse::<i64>().ok())
-                .collect::<Vec<_>>()
-        });
-        let shell = children.next()?;
-        let stat = std::fs::read_to_string(format!("/proc/{shell}/stat")).ok()?;
-        // comm may contain spaces and parentheses; fields resume after the
-        // last ')': state, ppid, pgrp, session, tty_nr, tpgid.
-        let foreground: i64 = stat
-            .get(stat.rfind(')')? + 2..)?
-            .split_whitespace()
-            .nth(5)?
-            .parse()
-            .ok()?;
-        if foreground == shell || foreground == -1 {
-            return None;
-        }
-        let comm = std::fs::read_to_string(format!("/proc/{foreground}/comm")).ok()?;
-        let comm = comm.trim();
-        (!comm.is_empty()).then(|| comm.to_string())
-    }
-
     /// Animation frame of a working job's icon, or None when it is idle.
     ///
     /// Frames come from the clock rather than from the title's spinner,
@@ -746,7 +736,8 @@ impl Daemon {
     fn window_icon(&mut self, window: &Node) -> Option<(u32, bool)> {
         let program = self.window_name(window)?;
         if TERMINAL_PROGRAMS.contains(&program.as_str())
-            && let Some(mut job) = Self::terminal_job(window)
+            && let Some(mut job) =
+                terminal::foreground_job(window.pid?, window.name(), job_title_marks)
         {
             let frame = self.spinner_frame(window, &job);
             // Frames missing from the loaded font fall back to the icon at rest.
@@ -770,17 +761,17 @@ impl Daemon {
                 Err(error) => log::warn!("Could not add job {job}: {error:#}"),
             }
         }
-        if favicons::is_browser(Some(&program))
+        if let Some(browser) = favicons::browser(&program)
             && let Some(host) = self
                 .favicons
                 .host_for_window(&program, window.name.as_deref())
         {
-            let favicon = favicon_program(&host);
+            let favicon = favicon_program(browser, &host);
             if let Some(&codepoint) = self.active_program_codepoints.get(&favicon) {
                 return Some((codepoint, false));
             }
             if !self.program_icon_map.contains(&favicon) {
-                self.add_favicon_later(&host);
+                self.add_favicon_later(browser, &host);
             }
         }
         self.active_unicode_id(&program)
@@ -788,21 +779,28 @@ impl Daemon {
     }
 
     /// Icon overlaid on favicons to show which browser a window is.
-    fn favicon_badge(&self) -> Option<PathBuf> {
-        FAVICON_BADGE_PROGRAMS
+    fn favicon_badge(&self, browser: &Browser) -> Option<PathBuf> {
+        browser
+            .app_ids
             .iter()
             .find_map(|p| self.program_icon_map.get_icon_path(p))
             .map(Path::to_path_buf)
+            .or_else(|| {
+                browser
+                    .app_ids
+                    .iter()
+                    .find_map(|p| desktop::find_icon_for_program(p))
+            })
     }
 
     /// Add or refresh a site's favicon; returns whether its glyph changed.
-    fn add_favicon(&mut self, host: &str) -> Result<bool> {
-        let program = favicon_program(host);
+    fn add_favicon(&mut self, browser: &Browser, host: &str) -> Result<bool> {
+        let program = favicon_program(browser, host);
         let entry = self.program_icon_map.programs.get(&program).cloned();
         if entry.as_ref().is_some_and(|e| e.icon_path.is_none()) {
             return Ok(false); // Known to have no favicon.
         }
-        let badge = self.favicon_badge();
+        let badge = self.favicon_badge(browser);
         let icon_path = self.favicons.export_icon(host, badge.as_deref(), 0);
         if let Some(entry) = entry {
             if icon_path.is_none() || icon_path == entry.icon_path {
@@ -829,19 +827,24 @@ impl Daemon {
         if !self.settings.titlebar_icons || !self.favicons.available() {
             return Ok(false);
         }
-        let mut hosts = self.favicons.top_hosts(FAVICON_TOP_SITES);
+        // Favicons from before they were kept per browser are dropped.
+        let before = self.program_icon_map.programs.len();
+        self.program_icon_map.programs.retain(|program, _| {
+            !program.starts_with(FAVICON_PREFIX) || parse_favicon_program(program).is_some()
+        });
+        let mut changed = before - self.program_icon_map.programs.len();
+        let mut sites = self.favicons.top_hosts(FAVICON_TOP_SITES);
         for program in self.program_icon_map.programs.keys() {
-            if let Some(host) = program.strip_prefix(FAVICON_PREFIX)
-                && !hosts.iter().any(|h| h == host)
+            if let Some((browser, host)) = parse_favicon_program(program)
+                && !sites.iter().any(|(b, h)| *b == browser && h == host)
             {
-                hosts.push(host.to_string());
+                sites.push((browser, host.to_string()));
             }
         }
-        let mut changed = 0;
-        for host in hosts {
+        for (browser, host) in sites {
             changed += usize::from(
-                self.add_favicon(&host)
-                    .with_context(|| format!("adding favicon for {host}"))?,
+                self.add_favicon(browser, &host)
+                    .with_context(|| format!("adding favicon for {host} in {}", browser.id))?,
             );
         }
         self.program_icon_map
@@ -855,8 +858,8 @@ impl Daemon {
     ///
     /// Deliberately silent: until then the browser icon is shown, and the
     /// favicon simply appears after some later login.
-    fn add_favicon_later(&mut self, host: &str) {
-        let added = self.add_favicon(host);
+    fn add_favicon_later(&mut self, browser: &Browser, host: &str) {
+        let added = self.add_favicon(browser, host);
         if let Err(error) = self.program_icon_map.save() {
             log::warn!("{error:#}");
         }
@@ -1381,6 +1384,64 @@ fn workspace_base_name(name: &str, icon_chars: &HashSet<char>) -> String {
     base.to_string()
 }
 
+/// Spins in every titlebar until dropped, then restores plain titles.
+///
+/// It has its own connection, since startup holds the daemon throughout.
+struct StartupSpinner {
+    stop: Option<Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StartupSpinner {
+    fn start(mut ipc: Box<dyn Ipc>, title: String) -> Self {
+        *STARTUP_SPINNING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Quick startups finish without a flash of spinners.
+            if stopped.recv_timeout(STARTUP_SPINNER_DELAY) != Err(RecvTimeoutError::Timeout) {
+                return;
+            }
+            let draw = |ipc: &mut dyn Ipc, format: &str| {
+                let spinning = STARTUP_SPINNING
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if *spinning {
+                    // Fails harmlessly when there are no windows.
+                    let _ = ipc.command(&format!("[all] title_format \"{format}\""));
+                }
+                *spinning
+            };
+            for frame in STARTUP_SPINNER.iter().cycle() {
+                if !draw(ipc.as_mut(), &format!("{frame} {title}")) {
+                    return;
+                }
+                if stopped.recv_timeout(STARTUP_SPINNER_FRAME) != Err(RecvTimeoutError::Timeout) {
+                    break;
+                }
+            }
+            draw(ipc.as_mut(), "%title");
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for StartupSpinner {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        *STARTUP_SPINNING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
+    }
+}
+
 /// Restores default workspace names and window titles.
 pub struct ResetPlan {
     icon_chars: HashSet<char>,
@@ -1390,6 +1451,9 @@ pub struct ResetPlan {
 
 impl ResetPlan {
     pub fn apply(&self, ipc: &mut dyn Ipc) -> Result<()> {
+        *STARTUP_SPINNING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
         let tree = ipc.get_tree().context("getting window tree")?;
         if self.titlebar_icons {
             for window in tree.leaves() {
@@ -1460,9 +1524,11 @@ pub fn lock(daemon: &Mutex<Daemon>) -> std::sync::MutexGuard<'_, Daemon> {
     daemon.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Run the daemon until the compositor goes away.
+/// Run the daemon until the compositor goes away. `spinner_ipc` shows a
+/// spinner in titlebars while startup is busy.
 pub fn run(
     daemon: &Arc<Mutex<Daemon>>,
+    spinner_ipc: Option<Box<dyn Ipc>>,
     connect_events: impl FnOnce() -> Result<crate::ipc::EventStream>,
 ) -> Result<()> {
     use crate::ipc::Event;
@@ -1471,10 +1537,14 @@ pub fn run(
     lock(daemon).rebuild_requests = Some(requests);
     {
         let mut guard = lock(daemon);
-        if !guard
+        let spinner = spinner_ipc
+            .filter(|_| guard.settings.titlebar_icons)
+            .map(|ipc| StartupSpinner::start(ipc, guard.title_text("%title")));
+        let ready = guard
             .ensure_startup_font()
-            .context("preparing the icon font")?
-        {
+            .context("preparing the icon font")?;
+        drop(spinner);
+        if !ready {
             return Ok(());
         }
         guard

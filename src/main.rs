@@ -14,7 +14,7 @@ use workspace_icon_daemon::daemon::{
     self, DEFAULT_FONT_FAMILY_NAME, Daemon, ResetPlan, Settings, UniqueIconsMode,
 };
 use workspace_icon_daemon::icon_map::ProgramIconMap;
-use workspace_icon_daemon::ipc::Connection;
+use workspace_icon_daemon::ipc::{Connection, Ipc};
 use workspace_icon_daemon::platform::{self, Compositor, detect_compositor};
 use workspace_icon_daemon::{assets, pidfile, xdg};
 
@@ -264,7 +264,10 @@ fn main() -> Result<()> {
     exit_on_signal(Arc::clone(&daemon), reset_plan, pid_path.clone())
         .context("setting up graceful exit")?;
 
-    let result = daemon::run(&daemon, || {
+    let spinner_ipc = Connection::connect()
+        .map(|c| Box::new(c) as Box<dyn Ipc>)
+        .ok();
+    let result = daemon::run(&daemon, spinner_ipc, || {
         Connection::connect()
             .context("connecting to the compositor")?
             .subscribe(&["window", "workspace", "binding", "shutdown"])

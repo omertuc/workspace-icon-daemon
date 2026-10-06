@@ -1,14 +1,15 @@
 //! Site favicons for browser windows, and the derived icons (badged,
 //! stacked, layout lines) baked into the font.
 //!
-//! Favicons come from Firefox's favicons.sqlite, and the most visited sites
-//! from places.sqlite; Firefox holds both locked while running, so they are
-//! read from a private copy.
+//! Favicons and the most visited sites come from each browser's profile
+//! databases: places.sqlite and favicons.sqlite for Firefox, History and
+//! Favicons for Chromium-based browsers. Browsers hold them locked while
+//! running, so they are read from a private copy.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
@@ -18,25 +19,158 @@ use regex::Regex;
 use crate::icon_map::FAVICON_PREFIX;
 use crate::{atspi, raster, xdg};
 
-const BROWSER_APP_IDS: [&str; 7] = [
-    "firefox",
-    "org.mozilla.firefox",
-    "firefox-esr",
-    "google-chrome",
-    "google-chrome-canary",
-    "chromium",
-    "chromium-browser",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    Gecko,
+    Chromium,
+}
+
+impl Engine {
+    /// The (history, favicons) database file names in a profile.
+    const fn databases(self) -> [&'static str; 2] {
+        match self {
+            Self::Gecko => ["places.sqlite", "favicons.sqlite"],
+            Self::Chromium => ["History", "Favicons"],
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Browser {
+    /// Stable name, part of its favicons' program-map keys.
+    pub id: &'static str,
+    engine: Engine,
+    /// Window app ids and classes, lowercase.
+    pub app_ids: &'static [&'static str],
+    /// Profile roots, relative to the home directory.
+    roots: &'static [&'static str],
+}
+
+const BROWSERS: [Browser; 9] = [
+    Browser {
+        id: "firefox",
+        engine: Engine::Gecko,
+        app_ids: &[
+            "firefox",
+            "org.mozilla.firefox",
+            "firefox-esr",
+            "firefox_firefox",
+            "firefox-developer-edition",
+            "firefox-nightly",
+        ],
+        roots: &[
+            ".config/mozilla/firefox",
+            ".mozilla/firefox",
+            ".var/app/org.mozilla.firefox/.mozilla/firefox",
+            ".var/app/org.mozilla.firefox/config/mozilla/firefox",
+            "snap/firefox/common/.mozilla/firefox",
+        ],
+    },
+    Browser {
+        id: "google-chrome",
+        engine: Engine::Chromium,
+        app_ids: &["google-chrome", "google-chrome-stable", "com.google.chrome"],
+        roots: &[
+            ".config/google-chrome",
+            ".var/app/com.google.Chrome/config/google-chrome",
+        ],
+    },
+    Browser {
+        id: "google-chrome-beta",
+        engine: Engine::Chromium,
+        app_ids: &["google-chrome-beta"],
+        roots: &[".config/google-chrome-beta"],
+    },
+    Browser {
+        id: "google-chrome-unstable",
+        engine: Engine::Chromium,
+        app_ids: &["google-chrome-unstable", "google-chrome-dev"],
+        roots: &[".config/google-chrome-unstable"],
+    },
+    Browser {
+        id: "google-chrome-canary",
+        engine: Engine::Chromium,
+        app_ids: &["google-chrome-canary"],
+        roots: &[".config/google-chrome-canary"],
+    },
+    Browser {
+        id: "chromium",
+        engine: Engine::Chromium,
+        app_ids: &[
+            "chromium",
+            "chromium-browser",
+            "org.chromium.chromium",
+            "chromium_chromium",
+        ],
+        roots: &[
+            ".config/chromium",
+            ".var/app/org.chromium.Chromium/config/chromium",
+            "snap/chromium/common/chromium",
+        ],
+    },
+    Browser {
+        id: "brave",
+        engine: Engine::Chromium,
+        app_ids: &["brave-browser", "brave", "com.brave.browser"],
+        roots: &[
+            ".config/BraveSoftware/Brave-Browser",
+            ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+        ],
+    },
+    Browser {
+        id: "vivaldi",
+        engine: Engine::Chromium,
+        app_ids: &["vivaldi-stable", "vivaldi", "com.vivaldi.vivaldi"],
+        roots: &[".config/vivaldi"],
+    },
+    Browser {
+        id: "microsoft-edge",
+        engine: Engine::Chromium,
+        app_ids: &[
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "microsoft-edge-beta",
+            "microsoft-edge-dev",
+            "com.microsoft.edge",
+        ],
+        roots: &[
+            ".config/microsoft-edge",
+            ".var/app/com.microsoft.Edge/config/microsoft-edge",
+        ],
+    },
 ];
+
+/// The browser a window's program is.
+pub fn browser(program: &str) -> Option<&'static Browser> {
+    let program = program.to_lowercase();
+    BROWSERS
+        .iter()
+        .find(|b| b.app_ids.contains(&program.as_str()))
+}
+
+fn browser_by_id(id: &str) -> Option<&'static Browser> {
+    BROWSERS.iter().find(|b| b.id == id)
+}
+
 /// Browser suffixes on window titles, which AT-SPI and Sway don't always
 /// agree on (e.g. "- Google Chrome" vs "- Google Chrome Canary").
-static BROWSER_TITLE_SUFFIX: LazyLock<Result<Regex, regex::Error>> =
-    LazyLock::new(|| Regex::new(r" [—-] (Mozilla Firefox|Google Chrome|Chromium)( [\w ]+)?$"));
+static BROWSER_TITLE_SUFFIX: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
+    Regex::new(
+        r" [—-] (Mozilla Firefox|Google Chrome|Chromium|Brave|Vivaldi|Microsoft\W*Edge)( [\w ]+)?$",
+    )
+});
 /// Icons at least this wide are downscaled into the font's 109px strike;
 /// smaller ones are upscaled, so the largest available is preferred below it.
 const PREFERRED_ICON_WIDTH: u32 = 109;
 const SVG_ICON_WIDTH: i64 = 65535;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MISS_RETRY: Duration = Duration::from_secs(2);
+/// Browsers whose history hasn't changed for this long aren't in use, and
+/// get no favicons up front.
+const IDLE_BROWSER: Duration = Duration::from_hours(24 * 30);
+/// Chromium visit times count microseconds from 1601; Unix time starts this
+/// many seconds later.
+const CHROMIUM_EPOCH_OFFSET_SECS: i64 = 11_644_473_600;
 /// Bump when favicon rendering changes, so cached images are re-rendered.
 const RENDER_VERSION: u32 = 2;
 
@@ -53,13 +187,20 @@ const BADGE_FRACTION: f64 = 0.5;
 /// Transparent gap cut around the badge so it reads on any titlebar colour.
 const BADGE_GAP_FRACTION: f64 = 0.06;
 
-/// Program-map key for a site's favicon.
-pub fn favicon_program(host: &str) -> String {
-    format!("{FAVICON_PREFIX}{host}")
+/// Program-map key for a site's favicon as shown in a browser, which badges
+/// it.
+pub fn favicon_program(browser: &Browser, host: &str) -> String {
+    format!("{FAVICON_PREFIX}{}/{host}", browser.id)
+}
+
+/// The browser and host of a favicon program-map key.
+pub fn parse_favicon_program(program: &str) -> Option<(&'static Browser, &str)> {
+    let (id, host) = program.strip_prefix(FAVICON_PREFIX)?.split_once('/')?;
+    Some((browser_by_id(id)?, host))
 }
 
 pub fn is_browser(program: Option<&str>) -> bool {
-    program.is_some_and(|p| BROWSER_APP_IDS.contains(&p.to_lowercase().as_str()))
+    program.and_then(browser).is_some()
 }
 
 pub fn page_title(window_title: &str) -> Result<String> {
@@ -70,12 +211,20 @@ pub fn page_title(window_title: &str) -> Result<String> {
     Ok(suffix.replace(window_title, "").into_owned())
 }
 
+/// Whether an AT-SPI application name is a browser.
+pub fn is_browser_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    ["firefox", "chrom", "brave", "vivaldi", "edge"]
+        .iter()
+        .any(|n| name.contains(n))
+}
+
 /// Browser family of an app id or AT-SPI application name.
 pub fn browser_family(name: &str) -> &'static str {
-    if name.to_lowercase().contains("chrom") {
-        "chrome"
-    } else {
+    if name.to_lowercase().contains("firefox") {
         "firefox"
+    } else {
+        "chrome"
     }
 }
 
@@ -107,34 +256,74 @@ fn ini_values(path: &Path, key: &str) -> Vec<HashMap<String, String>> {
     sections
 }
 
-fn firefox_profile_dirs() -> Vec<PathBuf> {
+fn firefox_profile_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for root in [
-        xdg::home().join(".config/mozilla/firefox"),
-        xdg::home().join(".mozilla/firefox"),
-    ] {
-        for section in ini_values(&root.join("installs.ini"), "default") {
-            dirs.extend(section.get("default").map(|default| root.join(default)));
-        }
-        for section in ini_values(&root.join("profiles.ini"), "path") {
-            let Some(path) = section.get("path") else {
-                continue;
+    for section in ini_values(&root.join("installs.ini"), "default") {
+        dirs.extend(section.get("default").map(|default| root.join(default)));
+    }
+    for section in ini_values(&root.join("profiles.ini"), "path") {
+        let Some(path) = section.get("path") else {
+            continue;
+        };
+        let relative = section.get("isrelative").is_none_or(|v| v == "1");
+        dirs.push(if relative {
+            root.join(path)
+        } else {
+            PathBuf::from(path)
+        });
+    }
+    dirs
+}
+
+/// Chromium keeps each profile ("Default", "Profile 1", ...) in its own
+/// directory under the root.
+fn chromium_profile_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs
+}
+
+#[derive(Debug, Clone)]
+struct Profile {
+    browser: &'static Browser,
+    dir: PathBuf,
+}
+
+impl Profile {
+    fn history_file(&self) -> PathBuf {
+        self.dir.join(self.browser.engine.databases()[0])
+    }
+
+    /// Whether the browser was used recently in this profile.
+    fn in_use(&self) -> bool {
+        std::fs::metadata(self.history_file())
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < IDLE_BROWSER))
+    }
+}
+
+fn browser_profiles(home: &Path) -> Vec<Profile> {
+    let mut profiles: Vec<Profile> = Vec::new();
+    for browser in &BROWSERS {
+        for root in browser.roots.iter().map(|r| home.join(r)) {
+            let dirs = match browser.engine {
+                Engine::Gecko => firefox_profile_dirs(&root),
+                Engine::Chromium => chromium_profile_dirs(&root),
             };
-            let relative = section.get("isrelative").is_none_or(|v| v == "1");
-            dirs.push(if relative {
-                root.join(path)
-            } else {
-                PathBuf::from(path)
-            });
+            for dir in dirs {
+                let profile = Profile { browser, dir };
+                if profile.history_file().is_file()
+                    && !profiles.iter().any(|p| p.dir == profile.dir)
+                {
+                    profiles.push(profile);
+                }
+            }
         }
     }
-    let mut unique: Vec<PathBuf> = Vec::new();
-    for dir in dirs {
-        if !unique.contains(&dir) && dir.join("places.sqlite").is_file() {
-            unique.push(dir);
-        }
-    }
-    unique
+    profiles
 }
 
 /// Sort key: SVG first, then the smallest icon covering the strike, then
@@ -149,34 +338,170 @@ fn icon_rank(width: i64) -> (u8, i64) {
     }
 }
 
-/// Resolve browser window titles to sites and export their favicons.
-pub struct FirefoxFavicons {
-    icon_dir: PathBuf,
-    db_dir: PathBuf,
-    profile_dirs: Vec<PathBuf>,
-    copied_at: Option<Instant>,
-    title_hosts: HashMap<(String, String), Option<String>>,
-    looked_up_at: Option<Instant>,
+/// How much a Chromium visit `age_days` ago counts towards a site's rank,
+/// after Firefox's frecency buckets.
+fn recency_weight(age_days: i64) -> f64 {
+    match age_days {
+        ..4 => 1.0,
+        4..14 => 0.7,
+        14..31 => 0.5,
+        31..90 => 0.3,
+        _ => 0.1,
+    }
 }
 
-impl FirefoxFavicons {
+fn chromium_now() -> i64 {
+    let unix = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+    unix.saturating_add(CHROMIUM_EPOCH_OFFSET_SECS * 1_000_000)
+}
+
+/// Sites by how much they are visited, from a copy of a profile's history.
+fn site_scores(engine: Engine, history: &Path) -> rusqlite::Result<HashMap<String, f64>> {
+    let db = rusqlite::Connection::open(history)?;
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    match engine {
+        Engine::Gecko => {
+            let mut statement = db.prepare(
+                "SELECT host, MAX(frecency) FROM moz_origins WHERE frecency > 0 GROUP BY host",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            for row in rows {
+                let (host, frecency) = row?;
+                let best = scores.entry(host).or_insert(0.0);
+                *best = best.max(frecency);
+            }
+        }
+        Engine::Chromium => {
+            let now = chromium_now();
+            let mut statement = db.prepare(
+                "SELECT url, visit_count, last_visit_time FROM urls
+                 WHERE hidden = 0 AND visit_count > 0
+                 AND (url LIKE 'http://%' OR url LIKE 'https://%')",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (url, visits, visited_at) = row?;
+                let Some(host) = atspi::host(Some(&url)) else {
+                    continue;
+                };
+                let age_days = (now - visited_at) / (86_400 * 1_000_000);
+                #[expect(clippy::cast_precision_loss, reason = "visit counts are small")]
+                let score = visits as f64 * recency_weight(age_days);
+                *scores.entry(host).or_insert(0.0) += score;
+            }
+        }
+    }
+    Ok(scores)
+}
+
+/// The (Unix time in microseconds, URL) of the latest visit to a page with
+/// this title, from a copy of a profile's history.
+fn title_visit(
+    engine: Engine,
+    history: &Path,
+    title: &str,
+) -> rusqlite::Result<Option<(i64, String)>> {
+    let db = rusqlite::Connection::open(history)?;
+    let (query, offset) = match engine {
+        Engine::Gecko => (
+            "SELECT last_visit_date, url FROM moz_places
+             WHERE title = ?1 AND last_visit_date IS NOT NULL
+             ORDER BY last_visit_date DESC LIMIT 1",
+            0,
+        ),
+        Engine::Chromium => (
+            "SELECT last_visit_time, url FROM urls
+             WHERE title = ?1 ORDER BY last_visit_time DESC LIMIT 1",
+            CHROMIUM_EPOCH_OFFSET_SECS * 1_000_000,
+        ),
+    };
+    let mut statement = db.prepare(query)?;
+    let mut rows = statement.query_map([title], |row| {
+        Ok((row.get::<_, i64>(0)? - offset, row.get::<_, String>(1)?))
+    })?;
+    rows.next().transpose()
+}
+
+/// Every stored icon of a site, as (width, data), from a copy of a
+/// profile's favicons database.
+fn site_icons(
+    engine: Engine,
+    favicons: &Path,
+    host: &str,
+) -> rusqlite::Result<Vec<(i64, Vec<u8>)>> {
+    let (http, https) = (format!("http://{host}/%"), format!("https://{host}/%"));
+    let db = rusqlite::Connection::open(favicons)?;
+    let mut statement = db.prepare(match engine {
+        Engine::Gecko => {
+            "SELECT i.width, i.data FROM moz_icons i
+             JOIN moz_icons_to_pages ip ON ip.icon_id = i.id
+             JOIN moz_pages_w_icons p ON p.id = ip.page_id
+             WHERE p.page_url LIKE ?1 OR p.page_url LIKE ?2
+             UNION
+             SELECT width, data FROM moz_icons
+             WHERE root = 1 AND (icon_url LIKE ?1 OR icon_url LIKE ?2)"
+        }
+        Engine::Chromium => {
+            "SELECT b.width, b.image_data FROM favicon_bitmaps b
+             JOIN icon_mapping m ON m.icon_id = b.icon_id
+             WHERE m.page_url LIKE ?1 OR m.page_url LIKE ?2
+             UNION
+             SELECT b.width, b.image_data FROM favicon_bitmaps b
+             JOIN favicons f ON f.id = b.icon_id
+             WHERE f.url LIKE ?1 OR f.url LIKE ?2"
+        }
+    })?;
+    let rows = statement.query_map([&http, &https], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+    })?;
+    rows.map(|row| row.map(|(width, data)| (width, data.unwrap_or_default())))
+        .collect()
+}
+
+/// Resolve browser window titles to sites and export their favicons.
+pub struct Favicons {
+    icon_dir: PathBuf,
+    db_dir: PathBuf,
+    profiles: Vec<Profile>,
+    copied_at: Option<Instant>,
+    /// Modification times of the database files when last copied.
+    copied: HashMap<PathBuf, SystemTime>,
+    title_hosts: HashMap<(String, String), Option<String>>,
+    looked_up_at: Option<Instant>,
+    /// Sites found for (browser, page title) in history, and when.
+    history_hosts: HashMap<(&'static str, String), (Instant, Option<String>)>,
+}
+
+impl Favicons {
     pub fn new(cache_dir: &Path) -> Self {
         Self {
             icon_dir: cache_dir.join("favicons"),
-            db_dir: cache_dir.join("firefox-db"),
-            profile_dirs: firefox_profile_dirs(),
+            db_dir: cache_dir.join("browser-db"),
+            profiles: browser_profiles(&xdg::home()),
             copied_at: None,
+            copied: HashMap::new(),
             title_hosts: HashMap::new(),
             looked_up_at: None,
+            history_hosts: HashMap::new(),
         }
     }
 
     pub fn available(&self) -> bool {
-        !self.profile_dirs.is_empty()
+        !self.profiles.is_empty()
     }
 
-    /// Copy the databases (with their write-ahead logs) out from under the
-    /// running browser. Returns whether a fresh copy was made.
+    /// Copy the databases (with their journals) out from under the running
+    /// browsers. Returns whether a fresh copy was made.
     fn refresh(&mut self, force: bool) -> bool {
         if !force
             && self
@@ -186,14 +511,22 @@ impl FirefoxFavicons {
             return false;
         }
         self.copied_at = Some(Instant::now());
-        for (index, profile) in self.profile_dirs.iter().enumerate() {
+        for (index, profile) in self.profiles.iter().enumerate() {
             let destination = self.db_dir.join(index.to_string());
             let _ = std::fs::create_dir_all(&destination);
-            for name in ["places.sqlite", "favicons.sqlite"] {
-                for suffix in ["", "-wal"] {
-                    let source = profile.join(format!("{name}{suffix}"));
+            for name in profile.browser.engine.databases() {
+                for suffix in ["", "-wal", "-journal"] {
+                    let source = profile.dir.join(format!("{name}{suffix}"));
                     let target = destination.join(format!("{name}{suffix}"));
-                    let result = if source.is_file() {
+                    let modified = std::fs::metadata(&source).and_then(|m| m.modified()).ok();
+                    if modified.is_some()
+                        && self.copied.get(&source) == modified.as_ref()
+                        && target.is_file()
+                    {
+                        continue;
+                    }
+                    let result = if let Some(modified) = modified {
+                        self.copied.insert(source.clone(), modified);
                         std::fs::copy(&source, &target).map(|_| ())
                     } else {
                         std::fs::remove_file(&target).or_else(|e| {
@@ -208,19 +541,24 @@ impl FirefoxFavicons {
                         log::debug!("Could not copy {}: {error}", source.display());
                     }
                 }
+                // A stale shared-memory index would not match a fresh log.
+                let _ = std::fs::remove_file(destination.join(format!("{name}-shm")));
             }
-            // A stale shared-memory index would not match the fresh log.
-            let _ = std::fs::remove_file(destination.join("places.sqlite-shm"));
-            let _ = std::fs::remove_file(destination.join("favicons.sqlite-shm"));
         }
         true
     }
 
-    fn databases(&self) -> Vec<(PathBuf, PathBuf)> {
-        (0..self.profile_dirs.len())
-            .map(|i| self.db_dir.join(i.to_string()))
-            .filter(|dir| dir.join("places.sqlite").is_file())
-            .map(|dir| (dir.join("places.sqlite"), dir.join("favicons.sqlite")))
+    /// Each profile with the copies of its (history, favicons) databases.
+    fn databases(&self) -> Vec<(&Profile, PathBuf, PathBuf)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| {
+                let dir = self.db_dir.join(i.to_string());
+                let [history, favicons] = profile.browser.engine.databases();
+                (profile, dir.join(history), dir.join(favicons))
+            })
+            .filter(|(_, history, _)| history.is_file())
             .collect()
     }
 
@@ -228,14 +566,19 @@ impl FirefoxFavicons {
     pub fn forget_window_titles(&mut self) {
         self.title_hosts.clear();
         self.looked_up_at = None;
+        self.history_hosts.retain(|_, (_, host)| host.is_some());
     }
 
-    /// The host a browser window with this title is showing.
+    /// The host a browser window with this title is showing: read from its
+    /// address bar, or else the site last visited with this page title.
     pub fn host_for_window(&mut self, program: &str, window_title: Option<&str>) -> Option<String> {
         let window_title = window_title.filter(|t| !t.is_empty())?;
         let title = page_title(window_title)
             .inspect_err(|error| log::warn!("{error:#}"))
             .ok()?;
+        if title == window_title {
+            return None; // No page title yet, e.g. a new or loading window.
+        }
         let key = (browser_family(program).to_string(), title);
         // Misses are retried: right after login the browser may not have
         // restored its windows onto the accessibility bus yet.
@@ -244,39 +587,78 @@ impl FirefoxFavicons {
             self.title_hosts = atspi::address_bar_hosts();
             self.looked_up_at = Some(Instant::now());
         }
-        self.title_hosts.get(&key).cloned().flatten()
+        if let Some(host) = self.title_hosts.get(&key).cloned().flatten() {
+            return Some(host);
+        }
+        // Chromium shows its address bar over AT-SPI only to screen readers.
+        self.history_host(browser(program)?, key.1)
     }
 
-    /// Most frecent sites, best first.
-    pub fn top_hosts(&mut self, limit: usize) -> Vec<String> {
+    /// The site most recently visited with this page title in the browser.
+    fn history_host(&mut self, browser: &'static Browser, title: String) -> Option<String> {
+        let key = (browser.id, title);
+        if let Some((at, host)) = self.history_hosts.get(&key)
+            && (host.is_some() || at.elapsed() < MISS_RETRY)
+        {
+            return host.clone();
+        }
+        // The visit may be newer than our copy of the history.
+        self.refresh(false);
+        let latest = self
+            .databases()
+            .into_iter()
+            .filter(|(profile, _, _)| profile.browser == browser)
+            .filter_map(|(profile, history, _)| {
+                title_visit(profile.browser.engine, &history, &key.1)
+                    .inspect_err(|error| {
+                        log::debug!("Could not query {}: {error}", history.display());
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .max_by_key(|(visited_at, _)| *visited_at);
+        let host = latest.and_then(|(_, url)| atspi::host(Some(&url)));
+        self.history_hosts
+            .insert(key, (Instant::now(), host.clone()));
+        host
+    }
+
+    /// Each browser in use with its most visited sites, best first.
+    pub fn top_hosts(&mut self, limit: usize) -> Vec<(&'static Browser, String)> {
         self.refresh(true);
-        let mut hosts: HashMap<String, i64> = HashMap::new();
-        for (places, _) in self.databases() {
-            let result = rusqlite::Connection::open(&places).and_then(|db| {
-                let mut statement = db.prepare(
-                    "SELECT host, MAX(frecency) FROM moz_origins WHERE frecency > 0 GROUP BY host",
-                )?;
-                let rows = statement.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?;
-                for row in rows {
-                    let (host, frecency) = row?;
-                    let best = hosts.entry(host).or_insert(0);
-                    *best = (*best).max(frecency);
+        let mut by_browser: HashMap<&'static str, HashMap<String, f64>> = HashMap::new();
+        for (profile, history, _) in self.databases() {
+            if !profile.in_use() {
+                continue;
+            }
+            let scores = match site_scores(profile.browser.engine, &history) {
+                Ok(scores) => scores,
+                Err(error) => {
+                    log::debug!("Could not query {}: {error}", history.display());
+                    continue;
                 }
-                Ok(())
-            });
-            if let Err(error) = result {
-                log::debug!("Could not query {}: {error}", places.display());
+            };
+            let hosts = by_browser.entry(profile.browser.id).or_default();
+            for (host, score) in scores {
+                let best = hosts.entry(host).or_insert(0.0);
+                *best = best.max(score);
             }
         }
-        let mut sorted: Vec<(String, i64)> = hosts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        sorted
-            .into_iter()
-            .take(limit)
-            .map(|(host, _)| host)
-            .collect()
+        let mut top = Vec::new();
+        for browser in &BROWSERS {
+            let Some(hosts) = by_browser.remove(browser.id) else {
+                continue;
+            };
+            let mut sorted: Vec<(String, f64)> = hosts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            top.extend(
+                sorted
+                    .into_iter()
+                    .take(limit)
+                    .map(|(host, _)| (browser, host)),
+            );
+        }
+        top
     }
 
     /// An icon file with a badge in its corner, e.g. Neovim's icon badged
@@ -298,34 +680,17 @@ impl FirefoxFavicons {
         save(&image, &cached)
     }
 
+    /// The site's icons stored by any browser; a site's icon is the same
+    /// whichever browser fetched it.
     fn favicon_candidates(&self, host: &str) -> Vec<(i64, Vec<u8>)> {
         let mut candidates = Vec::new();
-        let (http, https) = (format!("http://{host}/%"), format!("https://{host}/%"));
-        for (_, favicons) in self.databases() {
+        for (profile, _, favicons) in self.databases() {
             if !favicons.is_file() {
                 continue;
             }
-            let result = rusqlite::Connection::open(&favicons).and_then(|db| {
-                let mut statement = db.prepare(
-                    "SELECT i.width, i.data FROM moz_icons i
-                     JOIN moz_icons_to_pages ip ON ip.icon_id = i.id
-                     JOIN moz_pages_w_icons p ON p.id = ip.page_id
-                     WHERE p.page_url LIKE ?1 OR p.page_url LIKE ?2
-                     UNION
-                     SELECT width, data FROM moz_icons
-                     WHERE root = 1 AND (icon_url LIKE ?1 OR icon_url LIKE ?2)",
-                )?;
-                let rows = statement.query_map([&http, &https], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
-                })?;
-                for row in rows {
-                    let (width, data) = row?;
-                    candidates.push((width, data.unwrap_or_default()));
-                }
-                Ok(())
-            });
-            if let Err(error) = result {
-                log::debug!("Could not query {}: {error}", favicons.display());
+            match site_icons(profile.browser.engine, &favicons, host) {
+                Ok(icons) => candidates.extend(icons),
+                Err(error) => log::debug!("Could not query {}: {error}", favicons.display()),
             }
         }
         candidates
@@ -589,6 +954,111 @@ mod tests {
     }
 
     #[test]
+    fn browsers_by_app_id() {
+        assert_eq!(
+            browser("Google-chrome-canary").unwrap().id,
+            "google-chrome-canary"
+        );
+        assert_eq!(browser("brave-browser").unwrap().id, "brave");
+        assert_eq!(browser("org.mozilla.firefox").unwrap().id, "firefox");
+        assert!(browser("foot").is_none());
+        let chrome = browser("google-chrome").unwrap();
+        let key = favicon_program(chrome, "example.org:8080");
+        assert_eq!(key, "favicon:google-chrome/example.org:8080");
+        assert_eq!(
+            parse_favicon_program(&key),
+            Some((chrome, "example.org:8080"))
+        );
+        assert_eq!(parse_favicon_program("favicon:example.org"), None);
+        assert_eq!(page_title("Docs - Brave").unwrap(), "Docs");
+        assert_eq!(browser_family("Brave Browser"), "chrome");
+    }
+
+    #[test]
+    fn chromium_profiles_history_and_icons() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join(".config/google-chrome-canary/Profile 1");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(home.path().join(".config/google-chrome-canary/Crashpad")).unwrap();
+        let history = rusqlite::Connection::open(profile.join("History")).unwrap();
+        let now = chromium_now();
+        let old = now - 200 * 86_400 * 1_000_000;
+        history
+            .execute_batch(&format!(
+                "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT,
+                   visit_count INTEGER, typed_count INTEGER, last_visit_time INTEGER,
+                   hidden INTEGER);
+                 INSERT INTO urls (url, visit_count, last_visit_time, hidden) VALUES
+                   ('https://often.example/a', 5, {now}, 0),
+                   ('https://often.example/b', 5, {now}, 0),
+                   ('https://elsewhere.example/', 1, {old}, 0),
+                   ('https://once.example/', 1, {now}, 0),
+                   ('https://long-ago.example/', 50, {old}, 0),
+                   ('https://hidden.example/', 99, {now}, 1),
+                   ('chrome://settings/', 99, {now}, 0);
+                 UPDATE urls SET title = 'Often B'
+                   WHERE url IN ('https://often.example/b', 'https://elsewhere.example/');"
+            ))
+            .unwrap();
+        let favicons = rusqlite::Connection::open(profile.join("Favicons")).unwrap();
+        favicons
+            .execute_batch(
+                "CREATE TABLE favicons (id INTEGER PRIMARY KEY, url TEXT, icon_type INTEGER);
+                 CREATE TABLE favicon_bitmaps (id INTEGER PRIMARY KEY, icon_id INTEGER,
+                   last_updated INTEGER, image_data BLOB, width INTEGER, height INTEGER);
+                 CREATE TABLE icon_mapping (id INTEGER PRIMARY KEY, page_url TEXT,
+                   icon_id INTEGER);
+                 INSERT INTO favicons VALUES (1, 'https://cdn.example/often.png', 1);
+                 INSERT INTO favicon_bitmaps (icon_id, image_data, width) VALUES
+                   (1, x'01', 16), (1, x'02', 32);
+                 INSERT INTO icon_mapping (page_url, icon_id) VALUES
+                   ('https://often.example/a', 1);",
+            )
+            .unwrap();
+
+        assert_eq!(
+            title_visit(Engine::Chromium, &profile.join("History"), "Often B")
+                .unwrap()
+                .map(|(_, url)| url)
+                .as_deref(),
+            Some("https://often.example/b")
+        );
+        assert_eq!(
+            title_visit(Engine::Chromium, &profile.join("History"), "Nope").unwrap(),
+            None
+        );
+
+        let profiles = browser_profiles(home.path());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].browser.id, "google-chrome-canary");
+        assert!(profiles[0].in_use());
+
+        let scores = site_scores(Engine::Chromium, &profile.join("History")).unwrap();
+        let mut ranked: Vec<_> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let ranked: Vec<_> = ranked.into_iter().map(|(h, _)| h).collect();
+        assert_eq!(
+            ranked,
+            [
+                "often.example",
+                "long-ago.example",
+                "once.example",
+                "elsewhere.example"
+            ]
+        );
+
+        let mut icons =
+            site_icons(Engine::Chromium, &profile.join("Favicons"), "often.example").unwrap();
+        icons.sort();
+        assert_eq!(icons, [(16, vec![1]), (32, vec![2])]);
+        assert!(
+            site_icons(Engine::Chromium, &profile.join("Favicons"), "once.example")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn favicon_ranking_prefers_svg_then_covering_sizes() {
         let mut widths = vec![16, 256, SVG_ICON_WIDTH, 32, 128];
         widths.sort_by_key(|w| icon_rank(*w));
@@ -627,7 +1097,7 @@ mod tests {
         let image = raster::decode(&std::fs::read(line).unwrap()).unwrap();
         assert_eq!(raster::alpha_bbox(&image), Some((18, 114, 73, 8)));
 
-        let badged = FirefoxFavicons::new(dir.path())
+        let badged = Favicons::new(dir.path())
             .badged_icon(&icon, &icon, "job")
             .unwrap();
         let image = raster::decode(&std::fs::read(badged).unwrap()).unwrap();

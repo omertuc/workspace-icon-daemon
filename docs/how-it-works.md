@@ -62,8 +62,6 @@ creates a custom color font from program icons on the fly:
   or embed numbers directly in icons, but this has not been implemented yet.
 - The Unicode PUA used contains 6,399 code points, so having more applications
   than that installed could be an issue.
-- Sway is tested much better than i3. If you come across any bugs on i3, please
-  open an issue.
 - This system is relatively hacky. If you want something simpler, you can use
   the default approach of mapping programs to Nerd Font symbols used by many
   other setups.

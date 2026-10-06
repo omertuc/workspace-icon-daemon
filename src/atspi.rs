@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use zbus::blocking::Connection;
 use zbus::zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Type};
 
-use crate::favicons::{browser_family, page_title};
+use crate::favicons::{browser_family, is_browser_name, page_title};
 
 const ROLE_COMBO_BOX: u32 = 11;
 const ROLE_DOCUMENT_WEB: u32 = 95;
@@ -118,11 +118,6 @@ pub fn address_bar_hosts() -> HashMap<(String, String), Option<String>> {
     }
 }
 
-fn is_browser_app(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.contains("firefox") || name.contains("chrom")
-}
-
 fn read_address_bar_hosts() -> Result<HashMap<(String, String), Option<String>>> {
     let mut hosts: HashMap<(String, String), Option<String>> = HashMap::new();
     let bus = connect().context("connecting to AT-SPI")?;
@@ -133,7 +128,7 @@ fn read_address_bar_hosts() -> Result<HashMap<(String, String), Option<String>>>
     );
     let mut conflicting: HashSet<(String, String)> = HashSet::new();
     for app in children(&bus, &root) {
-        let Some(app_name) = name(&bus, &app).filter(|n| is_browser_app(n)) else {
+        let Some(app_name) = name(&bus, &app).filter(|n| is_browser_name(n)) else {
             continue;
         };
         for window in children(&bus, &app) {

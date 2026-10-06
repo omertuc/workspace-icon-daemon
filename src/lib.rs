@@ -11,6 +11,7 @@ pub mod ipc;
 pub mod pidfile;
 pub mod platform;
 pub mod raster;
+pub mod terminal;
 pub mod xdg;
 
 /// Apply `f` to every item on all CPUs, keeping the order.

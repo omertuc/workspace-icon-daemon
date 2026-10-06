@@ -2,6 +2,11 @@
 
 Run `workspace-icon-daemon --help` for the full list of options.
 
+## Requirements
+
+Fontconfig and `notify-send` (`fontconfig libnotify-bin` on Debian/Ubuntu,
+`fontconfig libnotify` on Arch).
+
 ## Options
 
 ```bash
@@ -10,7 +15,6 @@ workspace-icon-daemon --no-workspace-icons                 # Don't put icons int
 workspace-icon-daemon --unique-icons <MODE>                # nonunique | unique | numbers_subscript (default) | numbers_superscript
 workspace-icon-daemon --no-placeholder-icon                # Hide programs whose icon can't be found
 workspace-icon-daemon --title-text-size <PT>               # Title text size; set the compositor font larger for taller titlebars
-workspace-icon-daemon --compositor {auto,i3,sway}          # Explicitly specify the compositor
 workspace-icon-daemon --reset                              # Stop daemon, restore workspace and title names, remove state, and exit
 workspace-icon-daemon --reset-and-rebuild                  # Reset, prebuild/install the font, and exit
 workspace-icon-daemon --verbose                            # Enable debug output
@@ -53,7 +57,10 @@ bindsym $mod+Shift+2 move container to workspace number 2
 
 Browser windows show the favicon of the current site. The site is read from the
 browser's address bar over the AT-SPI accessibility bus, which most desktops
-already run.
+already run, and the favicon from the browser's own profile. Firefox and
+Chromium-based browsers (Chrome in any channel, Chromium, Brave, Vivaldi, Edge)
+are supported, including Flatpak and Snap installs. Each favicon carries a small
+badge of the browser it's shown in.
 
 ## Files
 
