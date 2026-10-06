@@ -32,34 +32,34 @@ update as applications open, close, and move.*
 
 ## Installation
 
-Workspace Icon Daemon requires Python 3.10 or newer, pip, Python's `venv`
-module, Fontconfig, Cairo, and `notify-send` for desktop notifications.
+Workspace Icon Daemon is a single Rust binary with the base font bundled in.
+At runtime it needs Fontconfig (`fc-cache`, `fc-match`) and `notify-send` for
+desktop notifications. Site favicons for browser windows additionally use the
+AT-SPI accessibility bus, which most desktops already run.
 
-On Debian or Ubuntu, install them with:
-
-```sh
-sudo apt install python3 python3-pip python3-venv fontconfig libcairo2 libnotify-bin
-```
-
-On Arch Linux, install them with:
+On Debian or Ubuntu, install the runtime tools with:
 
 ```sh
-sudo pacman -S python python-pip fontconfig cairo libnotify
+sudo apt install fontconfig libnotify-bin
 ```
 
-Clone the repository, create a dedicated virtual environment, and install the
-package into it:
+On Arch Linux:
+
+```sh
+sudo pacman -S fontconfig libnotify
+```
+
+Install a Rust toolchain (e.g. with [rustup](https://rustup.rs)), then build
+and install the daemon:
 
 ```sh
 git clone https://github.com/David0tt/workspace-icon-daemon
-python3 -m venv ~/.local/share/workspace-icon-daemon/venv
-~/.local/share/workspace-icon-daemon/venv/bin/python -m pip install ./workspace-icon-daemon
+cargo install --path ./workspace-icon-daemon
 ```
 
 The daemon executable is then available at
-`~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon`. The
-configuration examples below use this path, so activating the virtual
-environment is not required when the window manager starts the daemon.
+`~/.cargo/bin/workspace-icon-daemon`. The configuration examples below use this
+path.
 
 ## Configuration
 
@@ -76,7 +76,7 @@ bar {
     height 30
 }
 
-exec_always --no-startup-id ~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon
+exec_always --no-startup-id ~/.cargo/bin/workspace-icon-daemon
 ```
 
 For Sway with Waybar, add the font to `~/.config/waybar/style.css`:
@@ -92,7 +92,7 @@ Then add this to the Sway config:
 ```swayconfig
 font pango:monospace 18
 
-exec_always ~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon
+exec_always ~/.cargo/bin/workspace-icon-daemon
 ```
 
 Both workspace and titlebar icons are enabled by default. You can deactivate
@@ -107,8 +107,8 @@ visible.
 Override compositor detection when necessary:
 
 ```sh
-~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor sway
-~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor i3
+~/.cargo/bin/workspace-icon-daemon --compositor sway
+~/.cargo/bin/workspace-icon-daemon --compositor i3
 ```
 
 ### First start and newly installed applications
@@ -156,16 +156,15 @@ The persistent paths are:
 - `$XDG_CACHE_HOME/workspace-icon-daemon/WorkspaceIconDaemon.ttf`
 - `$XDG_DATA_HOME/fonts/WorkspaceIconDaemon.ttf`
 - `$XDG_CACHE_HOME/workspace-icon-daemon/daemon.pid`
+- `$XDG_DATA_HOME/workspace-icon-daemon/placeholder_icon.svg`
 
 The usual XDG defaults apply when those environment variables are unset.
 
 ## Development
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
-python -m unittest discover
+cargo test
+cargo run -- --verbose
 ```
 
 ## Limitations
@@ -236,16 +235,17 @@ font from program icons on-the-fly:
 
 ## Using the font builder standalone
 
-The bundled font builder can also be used stand alone to create an icon font
-from PNG and SVG files
+The font builder is also installed as a standalone tool to create an icon
+font from PNG and SVG files:
 
 ```sh
-python -m workspace_icon_daemon.font_builder --help
+icon-font-builder --help
 ```
 
-The base font must be a bitmap color font containing CBDT and CBLC tables. The
-repository includes a suitable `NotoColorEmoji.ttf` base font. Font generation
-is generally very tricky, and I can not guarantee it working with other fonts.
+The base font must be a bitmap color font containing CBDT and CBLC tables. A
+suitable `NotoColorEmoji.ttf` is bundled and used by default; `--base-font`
+selects another. Font generation is generally very tricky, and I can not
+guarantee it working with other fonts.
 
 ### Building a font
 
@@ -254,9 +254,8 @@ an explicit list, using either the `--input-folder` or `--icon-paths` flag.
 Example
 
 ```sh
-python -m workspace_icon_daemon.font_builder \
+icon-font-builder \
     --icon-paths /usr/share/icons/hicolor/scalable/apps/firefox.svg /usr/share/icons/breeze/apps/16/utilities-terminal.svg \
-    --base-font ./workspace_icon_daemon/NotoColorEmoji.ttf \
     --output ./MyIconFont.ttf \
     --family-name MyIconFont \
     --pua-start 0xE100 \

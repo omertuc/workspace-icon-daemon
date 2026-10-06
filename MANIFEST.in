@@ -1,4 +1,0 @@
-include README.md
-include LICENSE
-include bar-example.png
-recursive-include workspace_icon_daemon *.ttf *.svg
