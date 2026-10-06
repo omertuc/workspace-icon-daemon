@@ -9,7 +9,15 @@
 Shows the icons of your open apps in your Sway workspace names and window
 titlebars.
 
-![Workspace Icon Daemon in action on Sway with Waybar](docs/assets/demo.gif)
+![Apps opening into splits, tabs and stacks across workspaces](docs/assets/hero.webp)
+
+Browser windows show the site you're on.
+
+![Browsing between sites, the icon follows](docs/assets/browser.webp)
+
+Terminals show what's running in them.
+
+![Opening nvim in a terminal](docs/assets/terminal.webp)
 
 ## Install
 
