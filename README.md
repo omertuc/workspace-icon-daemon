@@ -15,7 +15,7 @@ Browser windows show the site you're on.
 
 ![Browsing between sites, the icon follows](docs/assets/browser.webp)
 
-Terminals show what's running in them.
+Terminals can show some app icons instead of the terminal's:
 
 ![Opening nvim in a terminal](docs/assets/terminal.webp)
 
@@ -41,8 +41,16 @@ and to `~/.config/waybar/style.css`:
 Log out and back in once after the first run.
 
 Workspace names change as windows move, so bind workspaces by number
-(`workspace number 1`).
+(workspaces should appear in scripts as e.g. `workspace number 1` rather than
+`workspace 1`).
 
 [Options](docs/configuration.md) ·
 [How it works](docs/how-it-works.md) ·
 [Font builder](docs/icon-font-builder.md)
+
+# Known problems
+
+[ ] Favicons sometimes use the wrong icon (e.g. Google Flights logo on google.com)
+[ ] Dynamic favicons are "frozen" (e.g. Google Calendar changes its icon depending on the current day) 
+[ ] Should remove special handling for Claude Code and spin the icon of any window that has a constantly changing title
+[ ] Font icons might link into other app that use those codepoints

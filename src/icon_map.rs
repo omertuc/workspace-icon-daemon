@@ -1,6 +1,7 @@
 //! The persistent mapping from programs to icon files and code points.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -8,13 +9,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::assets::{PLACEHOLDER_ICON_NAME, placeholder_icon_path};
 
-pub const PUA_START: u32 = 0xEC00; // clear of Nerd Font / Font Awesome glyphs used by the bar
+/// Every icon lives in Supplementary Private Use Area-B. Icon fonts such as
+/// Nerd Fonts fill the BMP Private Use Area and Private Use Area-A, and
+/// fontconfig falls back to any installed font that covers a missing glyph,
+/// so icons there show up in other applications in place of those glyphs.
+pub const PUA_START: u32 = 0x0010_0000;
 pub const PLACEHOLDER_CODEPOINT: u32 = PUA_START;
 pub const PROGRAM_PUA_START: u32 = PUA_START + 1;
-/// Site favicons live in Supplementary Private Use Area-B so that however
-/// many accumulate, they never run into the application icons or other icon
-/// fonts.
-pub const FAVICON_PUA_START: u32 = 0x0010_0000;
+/// Site favicons follow the application icons.
+pub const FAVICON_PUA_START: u32 = PUA_START + 0x400;
+/// The end of the favicon range, where the stacking glyphs begin.
+pub const FAVICON_PUA_END: u32 = 0x0010_8000;
 pub const FAVICON_PREFIX: &str = "favicon:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +51,8 @@ pub struct ProgramIconMap {
     pub programs: BTreeMap<String, ProgramIconEntry>,
     pub next_unicode_id: u32,
     pub next_favicon_id: u32,
-    /// Whether entries whose icons disappeared were dropped while loading.
+    /// Whether entries whose icons disappeared were dropped, or entries were
+    /// renumbered, while loading.
     pub modified_at_load: bool,
 }
 
@@ -104,24 +110,34 @@ impl ProgramIconMap {
             map.programs.insert(program, entry);
         }
 
-        let codepoints: Vec<u32> = map
+        // Entries outside their range, e.g. from versions that used the BMP
+        // Private Use Area, are renumbered after the rest, in their order.
+        let codepoints: Vec<(String, u32)> = map
             .programs
-            .values()
-            .filter_map(ProgramIconEntry::codepoint)
+            .iter()
+            .filter_map(|(program, entry)| Some((program.clone(), entry.codepoint()?)))
             .collect();
-        if let Some(max) = codepoints
-            .iter()
-            .filter(|&&cp| cp < FAVICON_PUA_START)
-            .max()
-        {
-            map.next_unicode_id = PROGRAM_PUA_START.max(max + 1);
+        let mut misplaced = Vec::new();
+        for (program, codepoint) in codepoints {
+            let (counter, range) = map.counter(&program);
+            if range.contains(&codepoint) {
+                *counter = (*counter).max(codepoint + 1);
+            } else {
+                misplaced.push((codepoint, program));
+            }
         }
-        if let Some(max) = codepoints
-            .iter()
-            .filter(|&&cp| cp >= FAVICON_PUA_START)
-            .max()
-        {
-            map.next_favicon_id = max + 1;
+        misplaced.sort();
+        let renumbered = !misplaced.is_empty();
+        for (old, program) in misplaced {
+            if let Some(codepoint) = map.allocate(&program) {
+                log::debug!("Renumbered {program}: U+{old:04X} -> U+{codepoint:04X}");
+                if let Some(entry) = map.programs.get_mut(&program) {
+                    entry.unicode_id = i64::from(codepoint);
+                }
+            } else {
+                log::warn!("No code point left for {program}. Removing entry.");
+                map.programs.remove(&program);
+            }
         }
         log::debug!(
             "Loaded {} programs from {}",
@@ -135,9 +151,11 @@ impl ProgramIconMap {
                 removed.len(),
                 removed.join(", ")
             );
+        }
+        if !removed.is_empty() || renumbered {
             map.modified_at_load = true;
         }
-        if !removed.is_empty() || relocated {
+        if !removed.is_empty() || relocated || renumbered {
             map.save()
                 .context("saving the cleaned-up program icon map")?;
         }
@@ -167,7 +185,19 @@ impl ProgramIconMap {
         if let Some(entry) = self.programs.get(program) {
             return Ok((false, entry.codepoint()));
         }
-        let Some(icon_path) = icon_path else {
+        if let Some(icon_path) = icon_path
+            && !icon_path.exists()
+        {
+            bail!("Icon path does not exist: {}", icon_path.display());
+        }
+        let icon = icon_path.and_then(|path| {
+            let codepoint = self.allocate(program);
+            if codepoint.is_none() {
+                log::warn!("No code point left for {program}, tracking without icon");
+            }
+            Some((path, codepoint?))
+        });
+        let Some((icon_path, codepoint)) = icon else {
             self.programs.insert(
                 program.to_string(),
                 ProgramIconEntry {
@@ -178,16 +208,6 @@ impl ProgramIconMap {
             log::debug!("Added program: {program} -> (no icon, no Unicode ID)");
             return Ok((true, None));
         };
-        if !icon_path.exists() {
-            bail!("Icon path does not exist: {}", icon_path.display());
-        }
-        let counter = if program.starts_with(FAVICON_PREFIX) {
-            &mut self.next_favicon_id
-        } else {
-            &mut self.next_unicode_id
-        };
-        let codepoint = *counter;
-        *counter += 1;
         self.programs.insert(
             program.to_string(),
             ProgramIconEntry {
@@ -200,6 +220,31 @@ impl ProgramIconMap {
             icon_path.display()
         );
         Ok((true, Some(codepoint)))
+    }
+
+    /// The next-code-point counter for a program and the range it draws from.
+    fn counter(&mut self, program: &str) -> (&mut u32, Range<u32>) {
+        if program.starts_with(FAVICON_PREFIX) {
+            (
+                &mut self.next_favicon_id,
+                FAVICON_PUA_START..FAVICON_PUA_END,
+            )
+        } else {
+            (
+                &mut self.next_unicode_id,
+                PROGRAM_PUA_START..FAVICON_PUA_START,
+            )
+        }
+    }
+
+    /// Take the next free code point for a program, if its range has one.
+    fn allocate(&mut self, program: &str) -> Option<u32> {
+        let (counter, range) = self.counter(program);
+        let codepoint = *counter;
+        range.contains(&codepoint).then(|| {
+            *counter += 1;
+            codepoint
+        })
     }
 
     pub fn get_unicode_id(&self, program: &str) -> Option<u32> {
@@ -261,13 +306,59 @@ mod tests {
         let mut restored = ProgramIconMap::load(&path).unwrap();
         assert!(restored.modified_at_load);
         assert!(!restored.contains("removed"));
-        assert_eq!(restored.get_unicode_id("retained"), Some(0xEC02));
+        assert_eq!(
+            restored.get_unicode_id("retained"),
+            Some(PROGRAM_PUA_START + 1)
+        );
         let (added, codepoint) = restored
             .add_program("another", Some(&dir.path().join("retained.png")))
             .unwrap();
         assert!(added);
-        assert_eq!(codepoint, Some(0xEC03));
+        assert_eq!(codepoint, Some(PROGRAM_PUA_START + 2));
         assert_eq!(restored.next_favicon_id, FAVICON_PUA_START + 1);
+    }
+
+    #[test]
+    fn renumbers_codepoints_outside_their_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let icon = dir.path().join("a.svg");
+        std::fs::write(&icon, b"<svg/>").unwrap();
+        let path = dir.path().join("programs.yaml");
+        let icon = icon.display();
+        std::fs::write(
+            &path,
+            format!(
+                "kept:\n  icon_path: {icon}\n  unicode_id: {PROGRAM_PUA_START}\n\
+                 old-b:\n  icon_path: {icon}\n  unicode_id: 60426\n\
+                 old-a:\n  icon_path: {icon}\n  unicode_id: 60427\n\
+                 favicon:old.example:\n  icon_path: {icon}\n  unicode_id: 1048578\n\
+                 favicon:kept.example:\n  icon_path: {icon}\n  unicode_id: {FAVICON_PUA_START}\n"
+            ),
+        )
+        .unwrap();
+        let mut map = ProgramIconMap::load(&path).unwrap();
+        assert!(map.modified_at_load);
+        assert_eq!(map.get_unicode_id("kept"), Some(PROGRAM_PUA_START));
+        // Renumbered entries keep their relative order.
+        assert_eq!(map.get_unicode_id("old-b"), Some(PROGRAM_PUA_START + 1));
+        assert_eq!(map.get_unicode_id("old-a"), Some(PROGRAM_PUA_START + 2));
+        assert_eq!(
+            map.get_unicode_id("favicon:old.example"),
+            Some(FAVICON_PUA_START + 1)
+        );
+        assert_eq!(
+            map.add_program("new", Some(Path::new(&icon.to_string())))
+                .unwrap()
+                .1,
+            Some(PROGRAM_PUA_START + 3)
+        );
+        // The renumbering was saved.
+        let reloaded = ProgramIconMap::load(&path).unwrap();
+        assert!(!reloaded.modified_at_load);
+        assert_eq!(
+            reloaded.get_unicode_id("old-a"),
+            Some(PROGRAM_PUA_START + 2)
+        );
     }
 
     #[test]
@@ -285,14 +376,17 @@ mod tests {
         )
         .unwrap();
         let map = ProgramIconMap::load(&path).unwrap();
-        assert_eq!(map.get_unicode_id("Alacritty"), Some(60439));
+        assert_eq!(map.get_unicode_id("Alacritty"), Some(PROGRAM_PUA_START));
         assert_eq!(map.get_unicode_id("foo"), None);
-        assert_eq!(map.get_unicode_id("old-placeholder"), Some(60440));
+        assert_eq!(
+            map.get_unicode_id("old-placeholder"),
+            Some(PROGRAM_PUA_START + 1)
+        );
         assert_eq!(
             map.get_icon_path("old-placeholder"),
             Some(placeholder_icon_path().as_path())
         );
-        assert!(!map.modified_at_load);
-        assert_eq!(map.next_unicode_id, 60441);
+        assert!(map.modified_at_load);
+        assert_eq!(map.next_unicode_id, PROGRAM_PUA_START + 2);
     }
 }

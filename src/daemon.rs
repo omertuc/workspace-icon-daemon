@@ -22,7 +22,7 @@ use crate::favicons::{
 };
 use crate::font_builder::{self, FontBuilder};
 use crate::icon_map::{
-    FAVICON_PREFIX, FAVICON_PUA_START, PLACEHOLDER_CODEPOINT, PUA_START, ProgramIconEntry,
+    FAVICON_PREFIX, FAVICON_PUA_END, PLACEHOLDER_CODEPOINT, PUA_START, ProgramIconEntry,
     ProgramIconMap,
 };
 use crate::ipc::{Ipc, Node};
@@ -31,9 +31,9 @@ use crate::terminal;
 use crate::xdg::APP_NAME;
 
 pub const DEFAULT_FONT_FAMILY_NAME: &str = "WorkspaceIconDaemon";
-/// Half-size top/bottom/middle copies of each icon, for stacking: slots
-/// 0-1023 mirror the application range, the rest mirror favicons.
-const STACK_TOP_START: u32 = 0x0010_8000;
+/// Half-size top/bottom/middle copies of each icon, for stacking: slot n
+/// mirrors code point `PUA_START + n`.
+const STACK_TOP_START: u32 = FAVICON_PUA_END;
 const STACK_BOTTOM_START: u32 = 0x0010_B000;
 const STACK_MIDDLE_START: u32 = 0x0010_E000;
 const STACK_SLOTS: u32 = 0x1FF0; // The middle range is the smallest.
@@ -73,7 +73,7 @@ fn layout_separator(layout: &str) -> &'static str {
 const STACK_DROP: f64 = 0.08;
 /// Bump when glyph layout changes without the set of icons changing, so the
 /// installed font gets rebuilt. Stored as the font's version string.
-pub const FONT_LAYOUT_VERSION: &str = "workspace-icon-daemon layout 5";
+pub const FONT_LAYOUT_VERSION: &str = "workspace-icon-daemon layout 6";
 /// Title markup sizes relative to the title text (icons, layout symbols) and
 /// to the compositor's title font (stacked icon pairs, which fill its line).
 const DEFAULT_TITLE_FONT_SIZE: f64 = 10.0;
@@ -147,13 +147,8 @@ static CLOCK_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Codepoints of an icon's top, bottom and middle stacking glyphs.
 pub fn stacked_codepoints(codepoint: u32) -> Option<(u32, u32, u32)> {
-    let slot = if codepoint >= FAVICON_PUA_START {
-        1024 + i64::from(codepoint - FAVICON_PUA_START)
-    } else {
-        i64::from(codepoint) - i64::from(PUA_START)
-    };
-    let slot = u32::try_from(slot)
-        .ok()
+    let slot = codepoint
+        .checked_sub(PUA_START)
         .filter(|slot| *slot < STACK_SLOTS)?;
     Some((
         STACK_TOP_START + slot,
@@ -361,7 +356,8 @@ pub struct Daemon {
     pub settings: Settings,
     pub program_icon_map: ProgramIconMap,
     pub font_installer: FontInstaller,
-    titlebar_icon_codepoints: HashMap<i64, u32>,
+    /// Each window's icon and title when its title format was last set.
+    titlebar_icons: HashMap<i64, (u32, String)>,
     split_container_formats: HashMap<i64, String>,
     stacking_available: bool,
     animating: bool,
@@ -395,7 +391,7 @@ impl Daemon {
             font_installer: FontInstaller {
                 fonts_dir: settings.fonts_dir.clone(),
             },
-            titlebar_icon_codepoints: HashMap::new(),
+            titlebar_icons: HashMap::new(),
             split_container_formats: HashMap::new(),
             stacking_available: false,
             animating: false,
@@ -913,7 +909,12 @@ impl Daemon {
                 continue;
             };
             visible.insert(window.id);
-            if self.titlebar_icon_codepoints.get(&window.id) == Some(&codepoint) {
+            // A title change reruns the compositor's for_window rules, which
+            // may replace the title format (e.g. `for_window [class=".*"]
+            // title_format "%title"` also matches Wayland windows), so the
+            // format is set again even when the icon is unchanged.
+            let applied = (codepoint, window.name().to_string());
+            if self.titlebar_icons.get(&window.id) == Some(&applied) {
                 continue;
             }
             // A leading zero-width space keeps the line metrics from the
@@ -926,7 +927,7 @@ impl Daemon {
             );
             // Record this before sending the command: changing title_format
             // may itself cause a window::title event on some compositor versions.
-            self.titlebar_icon_codepoints.insert(window.id, codepoint);
+            self.titlebar_icons.insert(window.id, applied);
             self.ipc
                 .command(&format!(
                     "[con_id={}] title_format \"{title_format}\"",
@@ -934,8 +935,7 @@ impl Daemon {
                 ))
                 .with_context(|| format!("setting title format of window {}", window.id))?;
         }
-        self.titlebar_icon_codepoints
-            .retain(|id, _| visible.contains(id));
+        self.titlebar_icons.retain(|id, _| visible.contains(id));
         self.update_split_container_titles(&family)
     }
 
@@ -1211,7 +1211,7 @@ impl Daemon {
         self.reset_plan()
             .apply(self.ipc.as_mut())
             .context("restoring workspace names and titles")?;
-        self.titlebar_icon_codepoints.clear();
+        self.titlebar_icons.clear();
         self.split_container_formats.clear();
         Ok(())
     }

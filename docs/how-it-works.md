@@ -40,8 +40,11 @@ creates a custom color font from program icons on the fly:
          each format/search tier, user-installed icons under `$XDG_DATA_HOME`
          take precedence over identically named icons in system data
          directories.
-2. It reserves `U+E000` for the placeholder icon and assigns stable PUA
-   (Private Use Area) Unicode code points to discovered applications.
+2. It reserves `U+100000` for the placeholder icon and assigns stable code
+   points from Supplementary Private Use Area-B to discovered applications
+   (from `U+100001`) and site favicons (from `U+100400`). Icon fonts such as
+   Nerd Fonts occupy the other Private Use Areas, and fontconfig would show
+   this font's icons in any application whose font lacks one of their glyphs.
 3. The first run builds the custom icon font, atomically installs it, refreshes
    fontconfig, notifies, and exits. No workspace or titlebar names are changed,
    since hot-swapping the loaded fonts for running applications (compositor,

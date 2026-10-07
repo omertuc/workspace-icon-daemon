@@ -5,6 +5,7 @@ use serde_json::json;
 
 use super::*;
 use crate::assets::BASE_FONT;
+use crate::icon_map::{FAVICON_PUA_START, PROGRAM_PUA_START};
 use crate::raster;
 
 #[derive(Clone, Default)]
@@ -144,7 +145,10 @@ fn font_rebuild_preserves_codepoints_after_icon_removal() {
 
     let mut restored = ProgramIconMap::load(&map.filepath).unwrap();
     assert!(restored.modified_at_load);
-    assert_eq!(restored.get_unicode_id("retained"), Some(0xEC02));
+    assert_eq!(
+        restored.get_unicode_id("retained"),
+        Some(PROGRAM_PUA_START + 1)
+    );
     // Shared icon paths must still receive their own glyphs.
     restored
         .add_program("another", Some(&root.join("retained.png")))
@@ -159,15 +163,23 @@ fn font_rebuild_preserves_codepoints_after_icon_removal() {
         .bitmap_codepoints
         .iter()
         .copied()
-        .filter(|cp| (0xE000..=0xF8FF).contains(cp))
+        .filter(|cp| *cp < FAVICON_PUA_END)
         .collect();
-    assert_eq!(pua, HashSet::from([0xEC00, 0xEC02, 0xEC03]));
+    assert_eq!(
+        pua,
+        HashSet::from([
+            PLACEHOLDER_CODEPOINT,
+            PROGRAM_PUA_START + 1,
+            PROGRAM_PUA_START + 2
+        ])
+    );
     let font = std::fs::read(&output).unwrap();
     let expected = raster::collect_image(&root.join("retained.png"), 109).unwrap();
-    assert_eq!(font_builder::glyph_png(&font, 0xEC02).unwrap(), expected);
-    assert_eq!(font_builder::glyph_png(&font, 0xEC03).unwrap(), expected);
+    for cp in [PROGRAM_PUA_START + 1, PROGRAM_PUA_START + 2] {
+        assert_eq!(font_builder::glyph_png(&font, cp).unwrap(), expected);
+    }
     // Stacking glyphs and layout lines are included.
-    let (top, bottom, middle) = stacked_codepoints(0xEC02).unwrap();
+    let (top, bottom, middle) = stacked_codepoints(PROGRAM_PUA_START + 1).unwrap();
     for cp in [
         top,
         bottom,
@@ -182,14 +194,14 @@ fn font_rebuild_preserves_codepoints_after_icon_removal() {
 #[test]
 fn stacked_codepoints_cover_programs_and_favicons() {
     assert_eq!(
-        stacked_codepoints(0xEC00),
+        stacked_codepoints(PLACEHOLDER_CODEPOINT),
         Some((0x0010_8000, 0x0010_B000, 0x0010_E000))
     );
     assert_eq!(
-        stacked_codepoints(0x0010_0002),
+        stacked_codepoints(FAVICON_PUA_START + 2),
         Some((0x0010_8402, 0x0010_B402, 0x0010_E402))
     );
-    assert_eq!(stacked_codepoints(0xE000), None);
+    assert_eq!(stacked_codepoints(0xEC00), None);
     assert_eq!(stacked_codepoints(0x0010_0000 + STACK_SLOTS), None);
 }
 
@@ -254,7 +266,7 @@ fn icon_count_modes_and_workspace_names() {
     assert_eq!(construct_workspace_name(3, &[], Some("3: mail")), "3: mail");
     assert_eq!(construct_workspace_name(-1, &[], Some("web")), "web");
 
-    let app = char::from_u32(0xEC01).unwrap();
+    let app = char::from_u32(PROGRAM_PUA_START).unwrap();
     let placeholder = char::from_u32(PLACEHOLDER_CODEPOINT).unwrap();
     let daemon = &fixture.daemon;
     assert_eq!(
@@ -281,7 +293,7 @@ fn workspaces_are_renamed_with_loaded_icons() {
     fixture.daemon.update_workspace_names().unwrap();
     let expected = format!(
         "rename workspace \"1\" to \"1: {}₂{}\"",
-        char::from_u32(0xEC01).unwrap(),
+        char::from_u32(PROGRAM_PUA_START).unwrap(),
         char::from_u32(PLACEHOLDER_CODEPOINT).unwrap()
     );
     assert_eq!(fixture.ipc.commands(), [expected]);
@@ -309,7 +321,7 @@ fn titlebar_icons_use_scoped_font_and_mapped_codepoint() {
     assert_eq!(
         fixture.ipc.commands(),
         [
-            "[con_id=41] title_format \"&#x200B;<span font_family='WorkspaceIconDaemon' size='14pt'>&#xEC01;</span> %title\""
+            "[con_id=41] title_format \"&#x200B;<span font_family='WorkspaceIconDaemon' size='14pt'>&#x100001;</span> %title\""
         ]
     );
     fixture.daemon.update_window_titles().unwrap();
@@ -319,10 +331,25 @@ fn titlebar_icons_use_scoped_font_and_mapped_codepoint() {
         "unchanged titles are not resent"
     );
 
-    fixture.daemon.settings.title_text_size = Some(9.0);
-    fixture.daemon.titlebar_icon_codepoints.clear();
+    // A title change can rerun for_window rules that replace the format.
+    fixture.ipc.set_tree(workspace(
+        1,
+        "1",
+        &json!([{"id": 41, "type": "con", "app_id": "app", "name": "1 new item", "nodes": []}]),
+    ));
     fixture.daemon.update_window_titles().unwrap();
-    assert!(fixture.ipc.commands()[1].ends_with("</span> <span size='9pt'>%title</span>\""));
+    assert_eq!(
+        fixture.ipc.commands().len(),
+        2,
+        "retitled windows are resent"
+    );
+    fixture.daemon.update_window_titles().unwrap();
+    assert_eq!(fixture.ipc.commands().len(), 2);
+
+    fixture.daemon.settings.title_text_size = Some(9.0);
+    fixture.daemon.titlebar_icons.clear();
+    fixture.daemon.update_window_titles().unwrap();
+    assert!(fixture.ipc.commands()[2].ends_with("</span> <span size='9pt'>%title</span>\""));
 }
 
 #[test]
@@ -343,8 +370,8 @@ fn split_containers_show_their_layout() {
         .iter()
         .find(|c| c.starts_with("[con_id=10]"))
         .unwrap();
-    let (top, _, _) = stacked_codepoints(0xEC01).unwrap();
-    let (_, bottom, _) = stacked_codepoints(0xEC01).unwrap();
+    let (top, _, _) = stacked_codepoints(PROGRAM_PUA_START).unwrap();
+    let (_, bottom, _) = stacked_codepoints(PROGRAM_PUA_START).unwrap();
     assert!(split_title.contains("<span foreground='#719cd6' weight='bold' size='10pt'>|</span>"));
     assert!(split_title.contains(&format!(
         "<span background='{FOCUS_HIGHLIGHT}'>{}{}{}</span>",
@@ -373,7 +400,10 @@ fn second_startup_uses_preinstalled_font_without_rebuilding() {
         std::fs::read(fixture.installed_font()).unwrap(),
         installed_before
     );
-    assert_eq!(fixture.daemon.active_unicode_id("app"), Some(0xEC01));
+    assert_eq!(
+        fixture.daemon.active_unicode_id("app"),
+        Some(PROGRAM_PUA_START)
+    );
     assert!(fixture.daemon.stacking_available);
 }
 
@@ -485,7 +515,7 @@ fn installed_desktop_entries_and_startup_class_are_prebuilt() {
 fn reset_restores_names_and_titles() {
     let mut fixture = Fixture::new();
     fixture.daemon.settings.titlebar_icons = true;
-    let name = format!("1: {}", char::from_u32(0xEC01).unwrap());
+    let name = format!("1: {}", char::from_u32(PROGRAM_PUA_START).unwrap());
     fixture
         .ipc
         .set_tree(workspace(1, &name, &json!([window(5, "app", 0, 0)])));
